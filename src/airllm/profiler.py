@@ -1,7 +1,6 @@
 import torch
 
 
-
 class LayeredProfiler:
     def __init__(self, print_memory=False):
         self.profiling_time_dict = {}

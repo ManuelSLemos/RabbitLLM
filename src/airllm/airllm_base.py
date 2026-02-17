@@ -1,21 +1,19 @@
+import time
+import torch
 
 from typing import List, Optional, Tuple, Union
 from tqdm import tqdm
 from pathlib import Path
-import time
 from concurrent.futures import ThreadPoolExecutor
-
-import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoModel, GenerationMixin, LlamaForCausalLM, GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from accelerate import init_empty_weights
-
 from accelerate.utils.modeling import set_module_tensor_to_device
 from transformers.quantizers import AutoHfQuantizer, HfQuantizer
+from optimum.bettertransformer import BetterTransformer
 
 from .profiler import LayeredProfiler
 
-from optimum.bettertransformer import BetterTransformer
 
 from .utils import clean_memory, load_layer, \
     find_or_create_local_splitted_path
@@ -28,8 +26,6 @@ try:
 except ImportError:
     bitsandbytes_installed = False
 
-
-
 try:
     from transformers.cache_utils import Cache, DynamicCache
 
@@ -37,10 +33,6 @@ try:
     print('>>>> cache_utils installed')
 except ImportError:
     cache_utils_installed = False
-
-
-
-
 
 
 class AirLLMBaseModel(GenerationMixin):
@@ -51,7 +43,6 @@ class AirLLMBaseModel(GenerationMixin):
                        'layer_prefix': 'model.layers',
                        'norm': 'model.norm',
                        'lm_head': 'lm_head',}
-
 
 
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=torch.float16, max_seq_len=512,
