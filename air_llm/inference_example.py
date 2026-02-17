@@ -18,4 +18,5 @@ generation_output = model.generate(
     use_cache=True,
     return_dict_in_generate=True)
 
-model.tokenizer.decode(generation_output.sequences[0])
+output = model.tokenizer.decode(generation_output.sequences[0])
+print(output)
