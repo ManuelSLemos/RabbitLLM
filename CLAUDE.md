@@ -17,7 +17,7 @@ pip install -e .
 pip install rabbitllm
 ```
 
-Note: setup.py includes a PostInstallCommand that auto-upgrades transformers to avoid rope_scaling compatibility issues.
+Note: The project supports `transformers>=4.47,<4.49`. For Qwen2/Qwen2.5 with 4.47+, see docs for position_embeddings and KV cache behavior.
 
 ## Running Tests
 
@@ -43,18 +43,18 @@ The central idea is processing models **one layer at a time** to fit within cons
 
 ### Key Classes
 
-**`RabbitLLMBaseModel`** (`src/rabbitllm/rabbitllm_base.py`) — Base class implementing the layer-streaming forward pass, inheriting `GenerationMixin` for text generation. All model variants extend this.
+**`RabbitLLMBaseModel`** (`src/rabbitllm/engine/base.py`) — Base class implementing the layer-streaming forward pass, inheriting `GenerationMixin` for text generation. All model variants extend this.
 
-**`AutoModel`** (`src/rabbitllm/auto_model.py`) — Factory that reads HuggingFace config `architectures` to select the right model class. On macOS, always returns the MLX implementation.
+**`AutoModel`** (`src/rabbitllm/models/registry.py`) — Factory that reads HuggingFace config `architectures` to select the right model class. On macOS, always returns the MLX implementation.
 
 **Model-specific subclasses** — Each overrides `set_layer_names_dict()` to map architecture-specific layer names and may customize positional embeddings or attention masks:
-- `RabbitLLMLlama2` (Llama2/3/3.1) — `rabbitllm.py`
-- `RabbitLLMQWen` / `RabbitLLMQWen2` — `rabbitllm_qwen.py` / `rabbitllm_qwen2.py`
-- `RabbitLLMChatGLM` — `rabbitllm_chatglm.py`
-- `RabbitLLMBaichuan` — `rabbitllm_baichuan.py`
-- `RabbitLLMInternLM` — `rabbitllm_internlm.py`
-- `RabbitLLMMistral` / `RabbitLLMMixtral` — `rabbitllm_mistral.py` / `rabbitllm_mixtral.py`
-- `RabbitLLMLlamaMlx` — `rabbitllm_llama_mlx.py` (Apple Silicon via MLX framework)
+- `RabbitLLMLlama2` (Llama2/3/3.1) — `models/llama.py`
+- `RabbitLLMQWen` / `RabbitLLMQWen2` — `models/qwen.py` / `models/qwen2.py`
+- `RabbitLLMChatGLM` — `models/chatglm.py`
+- `RabbitLLMBaichuan` — `models/baichuan.py`
+- `RabbitLLMInternLM` — `models/internlm.py`
+- `RabbitLLMMistral` / `RabbitLLMMixtral` — `models/mistral.py` / `models/mixtral.py`
+- `RabbitLLMLlamaMlx` — `engine/mlx_engine.py` (Apple Silicon via MLX framework)
 
 ### Platform Branching
 
@@ -63,6 +63,11 @@ The package uses platform detection (`sys.platform == "darwin"`) in both `__init
 ### Persistence Layer
 
 `src/rabbitllm/persist/` contains `ModelPersister` (abstract), `SafetensorModelPersister` (default), and `MlxModelPersister` (macOS) for reading/writing split layer files.
+
+### Device and Docker
+
+- If CUDA is requested but unavailable or fails to init, the engine falls back to `device="cpu"` and logs a warning (see [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)).
+- **Makefile**: `make bash` — CPU-only container (plain Python image). `make bash-gpu` — GPU-capable container (PyTorch + CUDA image); use when you need GPU inside Docker.
 
 ### Other Directories
 
@@ -77,7 +82,7 @@ The package uses platform detection (`sys.platform == "darwin"`) in both `__init
 Critical design decisions are documented in `docs/`:
 
 - **`docs/ARCHITECTURE.md`** — Relationship with HuggingFace (we use HF for model definitions, only customize loading and forward loop). Why we **do not** call `tie_weights()` and how tied `lm_head` is handled. KV cache (DynamicCache) and attention implementations (eager float mask, SDPA with mask=None, flash).
-- **`docs/COMPATIBILITY.md`** — Transformers version (4.44–4.46; avoid 4.47+). Model compatibility matrix. Single-file checkpoints.
+- **`docs/COMPATIBILITY.md`** — Transformers version (4.47+). Model compatibility matrix. Qwen2 4.47+ (position_embeddings, KV cache fallback). Single-file checkpoints.
 - **`docs/TROUBLESHOOTING.md`** — Zero logits (tied weights), eager mask, KV cache empty list, SDPA/cache alignment, dtype, single-file splits. How to debug forward vs HF.
 
 When changing loading, cache, or attention logic, check these docs to avoid regressions (e.g. QWen v1 / ChatGLM use custom cache kwargs).

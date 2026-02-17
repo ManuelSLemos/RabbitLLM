@@ -101,6 +101,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         self._supports_cache_class = False
         self.hf_quantizer = None
         self.attn_implementation = attn_implementation
+        self._warned_no_kv_cache = False
 
         if compression is not None:
             if not bitsandbytes_installed:
@@ -121,6 +122,24 @@ class RabbitLLMBaseModel(GenerationMixin):
                                                                                          layer_names=self.layer_names_dict,
                                                                                          hf_token=hf_token,
                                                                                          delete_original=delete_original)
+        # Use CPU if CUDA was requested but is not available or fails to init
+        if isinstance(device, str) and device.startswith("cuda"):
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=".*CUDA.*unknown error.*",
+                    category=UserWarning,
+                )
+                try:
+                    if not torch.cuda.is_available():
+                        logger.warning("CUDA not available, using device='cpu'")
+                        device = "cpu"
+                    else:
+                        # Force CUDA init to catch "CUDA unknown error" early
+                        torch.zeros(1, device=torch.device(device))
+                except RuntimeError as e:
+                    logger.warning("CUDA init failed (%s), using device='cpu'", e)
+                    device = "cpu"
         self.running_device = device
         self.device = torch.device(self.running_device)
 
@@ -328,7 +347,6 @@ class RabbitLLMBaseModel(GenerationMixin):
         self.move_layer_to_device(state_dict)
 
     def load_layer_to_cpu(self, layer_name):
-
         t = time.time()
 
         load_layer_output = load_layer(self.checkpoint_path, layer_name, self.profiling_mode)
@@ -469,7 +487,11 @@ class RabbitLLMBaseModel(GenerationMixin):
         """Extract (hidden_states, k_cache, v_cache) from a decoder layer output.
 
         Handles both legacy tuple format (eager) and Cache objects (SDPA/FA2).
+        In 4.47+, some layers (e.g. Qwen2) return only a tensor; caller may get
+        KV from the DynamicCache passed in kwargs.
         """
+        if isinstance(layer_out, torch.Tensor):
+            return layer_out, None, None
         hidden_states = layer_out[0]
         cache_idx = 2 if output_attentions else 1
         cache_data = layer_out[cache_idx] if len(layer_out) > cache_idx else None
@@ -495,7 +517,8 @@ class RabbitLLMBaseModel(GenerationMixin):
             cache = DynamicCache()
             if k_cache is not None and v_cache is not None:
                 cache.update(k_cache, v_cache, 0)
-            return {'past_key_value': cache}
+            # Qwen2 and other 4.47+ decoder layers expect past_key_values (plural)
+            return {'past_key_value': cache, 'past_key_values': cache}
         if k_cache is not None and v_cache is not None:
             return self.get_past_key_value_args(k_cache, v_cache)
         return {}
@@ -715,12 +738,30 @@ class RabbitLLMBaseModel(GenerationMixin):
                                 new_seq = layer(seq, **kwargs)[0]
                             else:
                                 past_kv_args = self._make_layer_past_kv_arg()
-                                kwargs = {'use_cache': True}
-                                kwargs = {**kwargs, **past_kv_args, **pos_embed_args, **attention_mask_args, **position_ids_args}
+                                # Qwen2 and other 4.47+ models need cache_position to update DynamicCache
+                                pos_slice = position_ids[:, 0:len_seq]
+                                kwargs = {
+                                    'use_cache': True,
+                                    'cache_position': pos_slice,
+                                    **past_kv_args,
+                                    **pos_embed_args,
+                                    **attention_mask_args,
+                                    **position_ids_args,
+                                }
 
                                 with self._layer_idx_as_zero(layer):
                                     layer_out = layer(seq, **kwargs)
+                                # In 4.47+, some layers (e.g. Qwen2) return only hidden_states and update
+                                # the DynamicCache in-place; extract KV from the cache we passed in.
                                 new_seq, k_cache, v_cache = self._extract_kv_from_layer_output(layer_out)
+                                if k_cache is None and cache_utils_installed and self._uses_cache_objects:
+                                    pkv = kwargs.get("past_key_value") or kwargs.get("past_key_values")
+                                    if isinstance(pkv, Cache):
+                                        key_cache = getattr(pkv, "key_cache", None)
+                                        value_cache = getattr(pkv, "value_cache", None)
+                                        if key_cache and value_cache and len(key_cache) > 0:
+                                            k_cache = key_cache[-1]
+                                            v_cache = value_cache[-1]
                                 if k_cache is not None:
                                     kv_cache_list[i][0].append(k_cache)
                                     kv_cache_list[i][1].append(v_cache)
@@ -747,10 +788,26 @@ class RabbitLLMBaseModel(GenerationMixin):
         logits = torch.cat(batch, 0)
         if use_cache:
             kv_cache_list = kv_cache_list[1:-2]
+            any_empty = False
             for i in range(len(kv_cache_list)):
-                # print(f"{i} - {kv_cache_list[i][0].shape}")
-                kv_cache_list[i] = (torch.cat(kv_cache_list[i][0], 0), torch.cat(kv_cache_list[i][1], 0))
-            #print(f"returning kvcache size: {kv_cache_list[0][0].shape}")
+                k_list, v_list = kv_cache_list[i][0], kv_cache_list[i][1]
+                if not k_list or not v_list:
+                    any_empty = True
+                    break
+            if any_empty:
+                # Decoder did not fill DynamicCache (e.g. Qwen2 4.47+ with layer-streaming).
+                # Return no cache so generation continues with full re-forward each step (slower).
+                if not self._warned_no_kv_cache:
+                    logger.warning(
+                        "KV cache was not filled by decoder layers; returning past_key_values=None. "
+                        "Generation will work but each step re-runs the full forward (no incremental decoding)."
+                    )
+                    self._warned_no_kv_cache = True
+                kv_cache_list = None
+            else:
+                for i in range(len(kv_cache_list)):
+                    k_list, v_list = kv_cache_list[i][0], kv_cache_list[i][1]
+                    kv_cache_list[i] = (torch.cat(k_list, 0), torch.cat(v_list, 0))
 
         if output_attentions:
             all_self_attns = all_self_attns[0:-2]
