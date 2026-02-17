@@ -4,32 +4,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-AirLLM enables running large language models (70B+ parameters) on GPUs with as little as 4GB VRAM by streaming model layers one at a time through GPU memory, avoiding the need for quantization, distillation, or pruning.
+RabbitLLM enables running large language models (70B+ parameters) on GPUs with as little as 4GB VRAM by streaming model layers one at a time through GPU memory, avoiding the need for quantization, distillation, or pruning.
 
 ## Build & Install
 
 ```bash
 # Install from source (editable mode)
-cd air_llm
+cd rabbit_llm
 pip install -e .
 
 # Install from PyPI
-pip install airllm
+pip install rabbitllm
 ```
 
 Note: setup.py includes a PostInstallCommand that auto-upgrades transformers to avoid rope_scaling compatibility issues.
 
 ## Running Tests
 
-Tests use unittest and live in `air_llm/tests/`. The compression test requires a CUDA GPU.
+Tests use unittest and live in `rabbit_llm/tests/`. The compression test requires a CUDA GPU.
 
 ```bash
 # Run all tests
-cd air_llm && python -m pytest tests/
+cd rabbit_llm && python -m pytest tests/
 
 # Run a single test module
-python -m unittest air_llm.tests.test_automodel
-python -m unittest air_llm.tests.test_compression
+python -m unittest rabbit_llm.tests.test_automodel
+python -m unittest rabbit_llm.tests.test_compression
 ```
 
 ## Architecture
@@ -39,22 +39,22 @@ python -m unittest air_llm.tests.test_compression
 The central idea is processing models **one layer at a time** to fit within constrained GPU memory:
 
 1. **Splitting phase**: `utils.split_and_save_layers()` takes a HuggingFace sharded checkpoint and saves each transformer layer as an individual safetensors file. Optional 4-bit/8-bit block-wise compression via bitsandbytes.
-2. **Inference phase**: `AirLLMBaseModel.forward()` creates an empty model skeleton, then for each layer: loads weights from disk → (optionally decompresses) → moves to GPU → runs forward pass → frees GPU memory. A background thread prefetches the next layer to overlap I/O with compute.
+2. **Inference phase**: `RabbitLLMBaseModel.forward()` creates an empty model skeleton, then for each layer: loads weights from disk → (optionally decompresses) → moves to GPU → runs forward pass → frees GPU memory. A background thread prefetches the next layer to overlap I/O with compute.
 
 ### Key Classes
 
-**`AirLLMBaseModel`** (`air_llm/airllm/airllm_base.py`) — Base class implementing the layer-streaming forward pass, inheriting `GenerationMixin` for text generation. All model variants extend this.
+**`RabbitLLMBaseModel`** (`rabbit_llm/rabbitllm/rabbitllm_base.py`) — Base class implementing the layer-streaming forward pass, inheriting `GenerationMixin` for text generation. All model variants extend this.
 
-**`AutoModel`** (`air_llm/airllm/auto_model.py`) — Factory that reads HuggingFace config `architectures` to select the right model class. On macOS, always returns the MLX implementation.
+**`AutoModel`** (`rabbit_llm/rabbitllm/auto_model.py`) — Factory that reads HuggingFace config `architectures` to select the right model class. On macOS, always returns the MLX implementation.
 
 **Model-specific subclasses** — Each overrides `set_layer_names_dict()` to map architecture-specific layer names and may customize positional embeddings or attention masks:
-- `AirLLMLlama2` (Llama2/3/3.1) — `airllm.py`
-- `AirLLMQWen` / `AirLLMQWen2` — `airllm_qwen.py` / `airllm_qwen2.py`
-- `AirLLMChatGLM` — `airllm_chatglm.py`
-- `AirLLMBaichuan` — `airllm_baichuan.py`
-- `AirLLMInternLM` — `airllm_internlm.py`
-- `AirLLMMistral` / `AirLLMMixtral` — `airllm_mistral.py` / `airllm_mixtral.py`
-- `AirLLMLlamaMlx` — `airllm_llama_mlx.py` (Apple Silicon via MLX framework)
+- `RabbitLLMLlama2` (Llama2/3/3.1) — `rabbitllm.py`
+- `RabbitLLMQWen` / `RabbitLLMQWen2` — `rabbitllm_qwen.py` / `rabbitllm_qwen2.py`
+- `RabbitLLMChatGLM` — `rabbitllm_chatglm.py`
+- `RabbitLLMBaichuan` — `rabbitllm_baichuan.py`
+- `RabbitLLMInternLM` — `rabbitllm_internlm.py`
+- `RabbitLLMMistral` / `RabbitLLMMixtral` — `rabbitllm_mistral.py` / `rabbitllm_mixtral.py`
+- `RabbitLLMLlamaMlx` — `rabbitllm_llama_mlx.py` (Apple Silicon via MLX framework)
 
 ### Platform Branching
 
@@ -62,7 +62,7 @@ The package uses platform detection (`sys.platform == "darwin"`) in both `__init
 
 ### Persistence Layer
 
-`air_llm/airllm/persist/` contains `ModelPersister` (abstract), `SafetensorModelPersister` (default), and `MlxModelPersister` (macOS) for reading/writing split layer files.
+`rabbit_llm/rabbitllm/persist/` contains `ModelPersister` (abstract), `SafetensorModelPersister` (default), and `MlxModelPersister` (macOS) for reading/writing split layer files.
 
 ### Other Directories
 
@@ -73,7 +73,7 @@ The package uses platform detection (`sys.platform == "darwin"`) in both `__init
 
 ## Adding a New Model
 
-1. Create a new file `air_llm/airllm/airllm_<model>.py`
-2. Subclass `AirLLMBaseModel` and override `set_layer_names_dict()` with the model's layer naming scheme
+1. Create a new file `rabbit_llm/rabbitllm/rabbitllm_<model>.py`
+2. Subclass `RabbitLLMBaseModel` and override `set_layer_names_dict()` with the model's layer naming scheme
 3. Add the architecture detection branch in `AutoModel.get_module_class()`
-4. Export the class in `air_llm/airllm/__init__.py`
+4. Export the class in `rabbit_llm/rabbitllm/__init__.py`

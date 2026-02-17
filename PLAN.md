@@ -1,8 +1,8 @@
-# Plan: Refactor & Rebrand AirLLM
+# Plan: Refactor & Rebrand RabbitLLM
 
 ## Context
 
-AirLLM is a discontinued project with a powerful core idea: **layer-streaming inference** that allows 70B+ LLMs to run on 4GB GPUs without quantization. The codebase works but suffers from legacy packaging, zero CI/CD, no type hints, print-based "logging", minimal tests (73 LOC), and missing features that modern tools like Ollama/vLLM offer (CLI, API server, streaming, chat templates). The goal is a full refactor + rebrand into a modern, production-grade project with both CLI and server capabilities.
+RabbitLLM is a discontinued project with a powerful core idea: **layer-streaming inference** that allows 70B+ LLMs to run on 4GB GPUs without quantization. The codebase works but suffers from legacy packaging, zero CI/CD, no type hints, print-based "logging", minimal tests (73 LOC), and missing features that modern tools like Ollama/vLLM offer (CLI, API server, streaming, chat templates). The goal is a full refactor + rebrand into a modern, production-grade project with both CLI and server capabilities.
 
 **Name**: TBD (using `newproject` as placeholder — will be replaced once decided).
 
@@ -12,7 +12,7 @@ AirLLM is a discontinued project with a powerful core idea: **layer-streaming in
 
 ### 1.1 Flatten directory structure
 
-Current awkward nesting `air_llm/airllm/` → clean `src/` layout:
+Current awkward nesting `rabbit_llm/rabbitllm/` → clean `src/` layout:
 
 ```
 src/newproject/
@@ -20,24 +20,24 @@ src/newproject/
   _version.py              # "3.0.0a1"
   engine/
     __init__.py
-    base.py                ← air_llm/airllm/airllm_base.py
-    mlx_engine.py          ← air_llm/airllm/airllm_llama_mlx.py
+    base.py                ← rabbit_llm/rabbitllm/rabbitllm_base.py
+    mlx_engine.py          ← rabbit_llm/rabbitllm/rabbitllm_llama_mlx.py
   models/
     __init__.py
-    registry.py            ← air_llm/airllm/auto_model.py
-    llama.py               ← air_llm/airllm/airllm.py
-    qwen.py                ← air_llm/airllm/airllm_qwen.py
-    qwen2.py               ← air_llm/airllm/airllm_qwen2.py
-    chatglm.py             ← air_llm/airllm/airllm_chatglm.py
-    baichuan.py            ← air_llm/airllm/airllm_baichuan.py
-    internlm.py            ← air_llm/airllm/airllm_internlm.py
-    mistral.py             ← air_llm/airllm/airllm_mistral.py
-    mixtral.py             ← air_llm/airllm/airllm_mixtral.py
+    registry.py            ← rabbit_llm/rabbitllm/auto_model.py
+    llama.py               ← rabbit_llm/rabbitllm/rabbitllm.py
+    qwen.py                ← rabbit_llm/rabbitllm/rabbitllm_qwen.py
+    qwen2.py               ← rabbit_llm/rabbitllm/rabbitllm_qwen2.py
+    chatglm.py             ← rabbit_llm/rabbitllm/rabbitllm_chatglm.py
+    baichuan.py            ← rabbit_llm/rabbitllm/rabbitllm_baichuan.py
+    internlm.py            ← rabbit_llm/rabbitllm/rabbitllm_internlm.py
+    mistral.py             ← rabbit_llm/rabbitllm/rabbitllm_mistral.py
+    mixtral.py             ← rabbit_llm/rabbitllm/rabbitllm_mixtral.py
   persist/
     __init__.py
-    base.py                ← air_llm/airllm/persist/model_persister.py
-    safetensor.py          ← air_llm/airllm/persist/safetensor_model_persister.py
-    mlx.py                 ← air_llm/airllm/persist/mlx_model_persister.py
+    base.py                ← rabbit_llm/rabbitllm/persist/model_persister.py
+    safetensor.py          ← rabbit_llm/rabbitllm/persist/safetensor_model_persister.py
+    mlx.py                 ← rabbit_llm/rabbitllm/persist/mlx_model_persister.py
   utils/
     __init__.py
     memory.py              ← clean_memory() etc. from utils.py
@@ -46,8 +46,8 @@ src/newproject/
     platform.py            ← NEW: single source of truth for platform detection
   compat/
     __init__.py
-    tokenization_baichuan.py ← air_llm/airllm/tokenization_baichuan.py
-  profiler.py              ← air_llm/airllm/profiler.py
+    tokenization_baichuan.py ← rabbit_llm/rabbitllm/tokenization_baichuan.py
+  profiler.py              ← rabbit_llm/rabbitllm/profiler.py
 tests/
   conftest.py
   test_model_registry.py
@@ -56,7 +56,7 @@ tests/
 
 ### 1.2 Delete legacy directories
 
-Remove entirely: `training/`, `rlhf/`, `anima_100k/`, `eval/`, `scripts/`, `data/`, `air_llm/` (after moving core files), `requirements.txt`, `README_ja.md`
+Remove entirely: `training/`, `rlhf/`, `anima_100k/`, `eval/`, `scripts/`, `data/`, `rabbit_llm/` (after moving core files), `requirements.txt`, `README_ja.md`
 
 ### 1.3 Create `pyproject.toml` (replace `setup.py`)
 
@@ -118,7 +118,7 @@ Break `engine/base.py:forward()` (lines 396–642) into:
 
 ### 2.4 Consolidate platform detection
 
-New `utils/platform.py` with `is_macos()` and `is_cuda_available()`. Replace 5 duplicate inline checks in `__init__.py`, `auto_model.py`, `utils.py`, `persist/model_persister.py`, `airllm_base.py`.
+New `utils/platform.py` with `is_macos()` and `is_cuda_available()`. Replace 5 duplicate inline checks in `__init__.py`, `auto_model.py`, `utils.py`, `persist/model_persister.py`, `rabbitllm_base.py`.
 
 ### 2.5 Fix bugs
 
@@ -230,12 +230,12 @@ Dev setup, running tests, code style, how to add a new model.
 
 | File | LOC | What happens to it |
 |------|-----|--------------------|
-| `air_llm/airllm/airllm_base.py` | 642 | → `src/newproject/engine/base.py` — heaviest refactor (forward decomposition, logging, types, config-driven) |
-| `air_llm/airllm/utils.py` | 403 | → split into `utils/memory.py`, `compression.py`, `splitting.py`, `platform.py` — bug fix, logging, types |
-| `air_llm/airllm/airllm_llama_mlx.py` | 436 | → `src/newproject/engine/mlx_engine.py` — logging, types |
-| `air_llm/airllm/auto_model.py` | 55 | → `src/newproject/models/registry.py` — config-driven rewrite, typo fix |
-| `air_llm/airllm/persist/model_persister.py` | 39 | → `src/newproject/persist/base.py` — ABC conversion, remove global state |
-| `air_llm/setup.py` | 49 | **Deleted** — replaced by `pyproject.toml` |
+| `rabbit_llm/rabbitllm/rabbitllm_base.py` | 642 | → `src/newproject/engine/base.py` — heaviest refactor (forward decomposition, logging, types, config-driven) |
+| `rabbit_llm/rabbitllm/utils.py` | 403 | → split into `utils/memory.py`, `compression.py`, `splitting.py`, `platform.py` — bug fix, logging, types |
+| `rabbit_llm/rabbitllm/rabbitllm_llama_mlx.py` | 436 | → `src/newproject/engine/mlx_engine.py` — logging, types |
+| `rabbit_llm/rabbitllm/auto_model.py` | 55 | → `src/newproject/models/registry.py` — config-driven rewrite, typo fix |
+| `rabbit_llm/rabbitllm/persist/model_persister.py` | 39 | → `src/newproject/persist/base.py` — ABC conversion, remove global state |
+| `rabbit_llm/setup.py` | 49 | **Deleted** — replaced by `pyproject.toml` |
 | 8 model subclass files | ~220 | Phase 1: move to `models/`. Phase 2: consolidate into `models/configs.py` |
 
 ## Phase Dependencies

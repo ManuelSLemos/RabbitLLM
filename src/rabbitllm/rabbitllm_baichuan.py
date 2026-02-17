@@ -1,14 +1,13 @@
 from transformers import GenerationConfig
 
-from .airllm_base import AirLLMBaseModel
+from .rabbitllm_base import RabbitLLMBaseModel
 from .tokenization_baichuan import BaichuanTokenizer
 
 
-class AirLLMBaichuan(AirLLMBaseModel):
-
+class RabbitLLMBaichuan(RabbitLLMBaseModel):
 
     def __init__(self, *args, **kwargs):
-        super(AirLLMBaichuan, self).__init__(*args, **kwargs)
+        super(RabbitLLMBaichuan, self).__init__(*args, **kwargs)
 
     def get_use_better_transformer(self):
         return False

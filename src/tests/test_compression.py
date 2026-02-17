@@ -2,9 +2,9 @@ import sys
 import unittest
 
 import torch
-sys.path.insert(0, '../airllm')
+sys.path.insert(0, '../rabbitllm')
 
-from airllm import compress_layer_state_dict, uncompress_layer_state_dict
+from rabbitllm import compress_layer_state_dict, uncompress_layer_state_dict
 
 
 

@@ -6,18 +6,18 @@ if platform == "darwin":
     is_on_mac_os = True
 
 if is_on_mac_os:
-    from .airllm_llama_mlx import AirLLMLlamaMlx
+    from .rabbitllm_llama_mlx import RabbitLLMLlamaMlx
     from .auto_model import AutoModel
 else:
-    from .airllm import AirLLMLlama2
-    from .airllm_chatglm import AirLLMChatGLM
-    from .airllm_qwen import AirLLMQWen
-    from .airllm_qwen2 import AirLLMQWen2
-    from .airllm_baichuan import AirLLMBaichuan
-    from .airllm_internlm import AirLLMInternLM
-    from .airllm_mistral import AirLLMMistral
-    from .airllm_mixtral import AirLLMMixtral
-    from .airllm_base import AirLLMBaseModel
+    from .rabbitllm import RabbitLLMLlama2
+    from .rabbitllm_chatglm import RabbitLLMChatGLM
+    from .rabbitllm_qwen import RabbitLLMQWen
+    from .rabbitllm_qwen2 import RabbitLLMQWen2
+    from .rabbitllm_baichuan import RabbitLLMBaichuan
+    from .rabbitllm_internlm import RabbitLLMInternLM
+    from .rabbitllm_mistral import RabbitLLMMistral
+    from .rabbitllm_mixtral import RabbitLLMMixtral
+    from .rabbitllm_base import RabbitLLMBaseModel
     from .auto_model import AutoModel
     from .utils import split_and_save_layers
     from .utils import NotEnoughSpaceException

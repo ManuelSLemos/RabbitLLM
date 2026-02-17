@@ -35,7 +35,7 @@ except ImportError:
     cache_utils_installed = False
 
 
-class AirLLMBaseModel(GenerationMixin):
+class RabbitLLMBaseModel(GenerationMixin):
 
     # customize layer names here
     def set_layer_names_dict(self):

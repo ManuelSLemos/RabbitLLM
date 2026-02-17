@@ -1,4 +1,4 @@
-![airllm_logo](https://github.com/lyogavin/airllm/blob/main/assets/airllm_logo_sm.png?v=3&raw=true)
+![rabbitllm_logo](https://github.com/lyogavin/rabbitllm/blob/main/assets/rabbitllm_logo_sm.png?v=3&raw=true)
 
 [**Quickstart**](#quickstart) | 
 [**Configurations**](#configurations) | 
@@ -6,17 +6,17 @@
 [**Example notebooks**](#example-python-notebook) | 
 [**FAQ**](#faq)
 
-**AirLLM** optimizes inference memory usage, allowing 70B large language models to run inference on a single 4GB GPU card. No quantization, distillation, pruning or other model compression techniques that would result in degraded model performance are needed.
+**RabbitLLM** optimizes inference memory usage, allowing 70B large language models to run inference on a single 4GB GPU card. No quantization, distillation, pruning or other model compression techniques that would result in degraded model performance are needed.
 
 <a href="https://github.com/lyogavin/Anima/stargazers">![GitHub Repo stars](https://img.shields.io/github/stars/lyogavin/Anima?style=social)</a>
-[![Downloads](https://static.pepy.tech/personalized-badge/airllm?period=total&units=international_system&left_color=grey&right_color=blue&left_text=downloads)](https://pepy.tech/project/airllm)
+[![Downloads](https://static.pepy.tech/personalized-badge/rabbitllm?period=total&units=international_system&left_color=grey&right_color=blue&left_text=downloads)](https://pepy.tech/project/rabbitllm)
 
 [![Code License](https://img.shields.io/badge/Code%20License-Apache_2.0-green.svg)](https://github.com/LianjiaTech/BELLE/blob/main/LICENSE)
 [![Generic badge](https://img.shields.io/badge/wechat-Anima-brightgreen?logo=wechat)](https://static.aicompose.cn/static/wecom_barcode.png?t=1671918938)
 [![Discord](https://img.shields.io/discord/1175437549783760896?logo=discord&color=7289da
 )](https://discord.gg/2xffU5sn)
-[![PyPI - AirLLM](https://img.shields.io/pypi/format/airllm?logo=pypi&color=3571a3)
-](https://pypi.org/project/airllm/)
+[![PyPI - RabbitLLM](https://img.shields.io/pypi/format/rabbitllm?logo=pypi&color=3571a3)
+](https://pypi.org/project/rabbitllm/)
 [![Website](https://img.shields.io/website?up_message=blog&url=https%3A%2F%2Fmedium.com%2F%40lyo.gavin&logo=medium&color=black)](https://medium.com/@lyo.gavin)
 [![Support me on Patreon](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fshieldsio-patreon.vercel.app%2Fapi%3Fusername%3Dgavinli%26type%3Dpatrons&style=flat)](https://patreon.com/gavinli)
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/lyogavin?logo=GitHub&color=lightgray)](https://github.com/sponsors/lyogavin)
@@ -24,11 +24,11 @@
 
 ## Updates
 
-[2024/04/20] AirLLM supports Llama3 natively already. Run Llama3 70B on 4GB single GPU.
+[2024/04/20] RabbitLLM supports Llama3 natively already. Run Llama3 70B on 4GB single GPU.
 
 [2023/12/25] v2.8.2: Support MacOS running 70B large language models.
 
-[2023/12/20] v2.7: Support AirLLMMixtral. 
+[2023/12/20] v2.7: Support RabbitLLMMixtral. 
 
 [2023/12/20] v2.6: Added AutoModel, automatically detect model type, no need to provide model class to initialize model.
 
@@ -38,9 +38,9 @@
 
 [2023/12/02] added support for safetensors. Now support all top 10 models in open llm leaderboard.
 
-[2023/12/01] airllm 2.0. Support compressions: **3x run time speed up!**
+[2023/12/01] rabbitllm 2.0. Support compressions: **3x run time speed up!**
 
-[2023/11/20] airllm Initial verion!
+[2023/11/20] rabbitllm Initial verion!
 
 ## Table of Contents
 
@@ -57,20 +57,20 @@
 
 ### 1. Install package
 
-First, install the airllm pip package.
+First, install the rabbitllm pip package.
 
 ```bash
-pip install airllm
+pip install rabbitllm
 ```
 
 ### 2. Inference
 
-Then, initialize AirLLMLlama2, pass in the huggingface repo ID of the model being used, or the local path, and inference can be performed similar to a regular transformer model.
+Then, initialize RabbitLLMLlama2, pass in the huggingface repo ID of the model being used, or the local path, and inference can be performed similar to a regular transformer model.
 
-(*You can also specify the path to save the splitted layered model through **layer_shards_saving_path** when init AirLLMLlama2.*
+(*You can also specify the path to save the splitted layered model through **layer_shards_saving_path** when init RabbitLLMLlama2.*
 
 ```python
-from airllm import AutoModel
+from rabbitllm import AutoModel
 
 MAX_LENGTH = 128
 # could use hugging face model repo id:
@@ -111,12 +111,12 @@ Note: During inference, the original model will first be decomposed and saved la
 
 We just added model compression based on block-wise quantization-based model compression. Which can further **speed up the inference speed** for up to **3x** , with **almost ignorable accuracy loss!** (see more performance evaluation and why we use block-wise quantization in [this paper](https://arxiv.org/abs/2212.09720))
 
-![speed_improvement](https://github.com/lyogavin/Anima/blob/main/assets/airllm2_time_improvement.png?v=2&raw=true)
+![speed_improvement](https://github.com/lyogavin/Anima/blob/main/assets/rabbitllm2_time_improvement.png?v=2&raw=true)
 
 #### How to enable model compression speed up:
 
 * Step 1. make sure you have [bitsandbytes](https://github.com/TimDettmers/bitsandbytes) installed by `pip install -U bitsandbytes `
-* Step 2. make sure airllm verion later than 2.0.0: `pip install -U airllm` 
+* Step 2. make sure rabbitllm verion later than 2.0.0: `pip install -U rabbitllm` 
 * Step 3. when initialize the model, passing the argument compression ('4bit' or '8bit'):
 
 ```python
@@ -139,12 +139,12 @@ When initialize the model, we support the following configurations:
 * **profiling_mode**: supported options: True to output time consumptions or by default False
 * **layer_shards_saving_path**: optionally another path to save the splitted model
 * **hf_token**: huggingface token can be provided here if downloading gated models like: *meta-llama/Llama-2-7b-hf*
-* **prefetching**: prefetching to overlap the model loading and compute. By default, turned on. For now, only AirLLMLlama2 supports this.
+* **prefetching**: prefetching to overlap the model loading and compute. By default, turned on. For now, only RabbitLLMLlama2 supports this.
 * **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
 
 ## MacOS
 
-Just install airllm and run the code the same as on linux. See more in [Quick Start](#quickstart).
+Just install rabbitllm and run the code the same as on linux. See more in [Quick Start](#quickstart).
 
 * make sure you installed [mlx](https://github.com/ml-explore/mlx?tab=readme-ov-file#installation) and torch
 * you probabaly need to install python native see more [here](https://stackoverflow.com/a/65432861/21230266)
@@ -169,7 +169,7 @@ Example colabs here:
 * ChatGLM:
 
 ```python
-from airllm import AutoModel
+from rabbitllm import AutoModel
 MAX_LENGTH = 128
 model = AutoModel.from_pretrained("THUDM/chatglm3-6b-base")
 input_text = ['What is the capital of China?',]
@@ -190,7 +190,7 @@ model.tokenizer.decode(generation_output.sequences[0])
 * QWen:
 
 ```python
-from airllm import AutoModel
+from rabbitllm import AutoModel
 MAX_LENGTH = 128
 model = AutoModel.from_pretrained("Qwen/Qwen-7B")
 input_text = ['What is the capital of China?',]
@@ -211,7 +211,7 @@ model.tokenizer.decode(generation_output.sequences[0])
 * Baichuan, InternLM, Mistral, etc:
 
 ```python
-from airllm import AutoModel
+from rabbitllm import AutoModel
 MAX_LENGTH = 128
 model = AutoModel.from_pretrained("baichuan-inc/Baichuan2-7B-Base")
 #model = AutoModel.from_pretrained("internlm/internlm-20b")
@@ -262,14 +262,14 @@ Most likely you are loading QWen or ChatGLM model with Llama2 class. Try the fol
 For QWen model: 
 
 ```python
-from airllm import AutoModel #<----- instead of AirLLMLlama2
+from rabbitllm import AutoModel #<----- instead of RabbitLLMLlama2
 AutoModel.from_pretrained(...)
 ```
 
 For ChatGLM model: 
 
 ```python
-from airllm import AutoModel #<----- instead of AirLLMLlama2
+from rabbitllm import AutoModel #<----- instead of RabbitLLMLlama2
 AutoModel.from_pretrained(...)
 ```
 
@@ -295,16 +295,16 @@ input_tokens = model.tokenizer(input_text,
 )
 ```
 
-## Citing AirLLM
+## Citing RabbitLLM
 
 If you find
-AirLLM useful in your research and wish to cite it, please use the following
+RabbitLLM useful in your research and wish to cite it, please use the following
 BibTex entry:
 
 ```
-@software{airllm2023,
+@software{rabbitllm2023,
   author = {Gavin Li},
-  title = {AirLLM: scaling large language models on low-end commodity computers},
+  title = {RabbitLLM: scaling large language models on low-end commodity computers},
   url = {https://github.com/lyogavin/Anima/tree/main/air_llm},
   version = {0.0},
   year = {2023},

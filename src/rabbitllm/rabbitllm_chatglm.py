@@ -1,17 +1,17 @@
 
 from transformers import GenerationConfig
 
-from .airllm_base import AirLLMBaseModel
+from .rabbitllm_base import RabbitLLMBaseModel
 
 
 
-class AirLLMChatGLM(AirLLMBaseModel):
+class RabbitLLMChatGLM(RabbitLLMBaseModel):
 
 
     def __init__(self, *args, **kwargs):
 
 
-        super(AirLLMChatGLM, self).__init__(*args, **kwargs)
+        super(RabbitLLMChatGLM, self).__init__(*args, **kwargs)
 
     def get_use_better_transformer(self):
         return False

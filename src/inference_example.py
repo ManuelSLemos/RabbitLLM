@@ -1,4 +1,4 @@
-from airllm import AutoModel
+from rabbitllm import AutoModel
 
 MAX_LENGTH = 128
 

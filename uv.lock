@@ -176,55 +176,6 @@ wheels = [
 ]
 
 [[package]]
-name = "airllm"
-version = "2.11.0"
-source = { editable = "." }
-dependencies = [
-    { name = "accelerate" },
-    { name = "einops" },
-    { name = "huggingface-hub" },
-    { name = "optimum" },
-    { name = "safetensors" },
-    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "scipy", version = "1.17.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "tiktoken" },
-    { name = "torch" },
-    { name = "tqdm" },
-    { name = "transformers" },
-    { name = "transformers-stream-generator" },
-]
-
-[package.optional-dependencies]
-compression = [
-    { name = "bitsandbytes" },
-]
-dev = [
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "accelerate", specifier = ">=0.25" },
-    { name = "bitsandbytes", marker = "extra == 'compression'" },
-    { name = "einops", specifier = ">=0.8.2" },
-    { name = "huggingface-hub", specifier = ">=0.20" },
-    { name = "mypy", marker = "extra == 'dev'" },
-    { name = "optimum", specifier = "==1.17.0" },
-    { name = "pytest", marker = "extra == 'dev'" },
-    { name = "ruff", marker = "extra == 'dev'" },
-    { name = "safetensors", specifier = ">=0.4" },
-    { name = "scipy" },
-    { name = "tiktoken", specifier = ">=0.12.0" },
-    { name = "torch", specifier = ">=2.0" },
-    { name = "tqdm" },
-    { name = "transformers", specifier = "==4.38.2" },
-    { name = "transformers-stream-generator", specifier = ">=0.0.5" },
-]
-provides-extras = ["compression", "server", "dev"]
-
-[[package]]
 name = "anyio"
 version = "4.12.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1977,6 +1928,55 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f0/7a/1c7270340330e575b92f397352af856a8c06f230aa3e76f86b39d01b416a/pyyaml-6.0.3-cp314-cp314t-win_amd64.whl", hash = "sha256:4ad1906908f2f5ae4e5a8ddfce73c320c2a1429ec52eafd27138b7f1cbe341c9", size = 174062, upload-time = "2025-09-25T21:32:55.767Z" },
     { url = "https://files.pythonhosted.org/packages/f1/12/de94a39c2ef588c7e6455cfbe7343d3b2dc9d6b6b2f40c4c6565744c873d/pyyaml-6.0.3-cp314-cp314t-win_arm64.whl", hash = "sha256:ebc55a14a21cb14062aa4162f906cd962b28e2e9ea38f9b4391244cd8de4ae0b", size = 149341, upload-time = "2025-09-25T21:32:56.828Z" },
 ]
+
+[[package]]
+name = "rabbitllm"
+version = "2.11.0"
+source = { editable = "." }
+dependencies = [
+    { name = "accelerate" },
+    { name = "einops" },
+    { name = "huggingface-hub" },
+    { name = "optimum" },
+    { name = "safetensors" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "tiktoken" },
+    { name = "torch" },
+    { name = "tqdm" },
+    { name = "transformers" },
+    { name = "transformers-stream-generator" },
+]
+
+[package.optional-dependencies]
+compression = [
+    { name = "bitsandbytes" },
+]
+dev = [
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "accelerate", specifier = ">=0.25" },
+    { name = "bitsandbytes", marker = "extra == 'compression'" },
+    { name = "einops", specifier = ">=0.8.2" },
+    { name = "huggingface-hub", specifier = ">=0.20" },
+    { name = "mypy", marker = "extra == 'dev'" },
+    { name = "optimum", specifier = "==1.17.0" },
+    { name = "pytest", marker = "extra == 'dev'" },
+    { name = "ruff", marker = "extra == 'dev'" },
+    { name = "safetensors", specifier = ">=0.4" },
+    { name = "scipy" },
+    { name = "tiktoken", specifier = ">=0.12.0" },
+    { name = "torch", specifier = ">=2.0" },
+    { name = "tqdm" },
+    { name = "transformers", specifier = "==4.38.2" },
+    { name = "transformers-stream-generator", specifier = ">=0.0.5" },
+]
+provides-extras = ["compression", "server", "dev"]
 
 [[package]]
 name = "regex"

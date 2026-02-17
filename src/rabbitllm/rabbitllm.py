@@ -1,6 +1,6 @@
-from .airllm_base import AirLLMBaseModel
+from .rabbitllm_base import RabbitLLMBaseModel
 
 
-class AirLLMLlama2(AirLLMBaseModel):
+class RabbitLLMLlama2(RabbitLLMBaseModel):
     def __init__(self, *args, **kwargs):
-        super(AirLLMLlama2, self).__init__(*args, **kwargs)
+        super(RabbitLLMLlama2, self).__init__(*args, **kwargs)
