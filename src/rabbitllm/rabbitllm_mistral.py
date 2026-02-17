@@ -13,8 +13,6 @@ class RabbitLLMMistral(RabbitLLMBaseModel):
 
         super(RabbitLLMMistral, self).__init__(*args, **kwargs)
 
-    def get_use_better_transformer(self):
-        return False
     def get_generation_config(self):
         return GenerationConfig()
 

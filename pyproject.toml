@@ -19,7 +19,6 @@ dependencies = [
     "transformers==4.38.2",
     "accelerate>=0.25",
     "safetensors>=0.4",
-    "optimum==1.17.0",
     "huggingface-hub>=0.20",
     "scipy",
     "transformers-stream-generator>=0.0.5",
@@ -34,6 +33,7 @@ classifiers = [
 
 [project.optional-dependencies]
 compression = ["bitsandbytes"]
+flash = ["flash-attn>=2.5"]
 server = []
 dev = ["ruff", "pytest", "mypy"]
 

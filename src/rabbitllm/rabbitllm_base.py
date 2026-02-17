@@ -1,4 +1,9 @@
+import contextlib
+import io
+import logging
+import os
 import time
+import warnings
 import torch
 
 from typing import List, Optional, Tuple, Union
@@ -10,19 +15,20 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from accelerate import init_empty_weights
 from accelerate.utils.modeling import set_module_tensor_to_device
 from transformers.quantizers import AutoHfQuantizer, HfQuantizer
-from optimum.bettertransformer import BetterTransformer
 
 from .profiler import LayeredProfiler
 
 
 from .utils import clean_memory, load_layer, \
-    find_or_create_local_splitted_path
+    find_or_create_local_splitted_path, is_flash_attention_available
+
+logger = logging.getLogger(__name__)
 
 try:
     import bitsandbytes as bnb
 
     bitsandbytes_installed = True
-    print('>>>> bitsandbytes installed')
+    logger.info("bitsandbytes installed")
 except ImportError:
     bitsandbytes_installed = False
 
@@ -30,9 +36,16 @@ try:
     from transformers.cache_utils import Cache, DynamicCache
 
     cache_utils_installed = True
-    print('>>>> cache_utils installed')
+    logger.info("cache_utils installed")
 except ImportError:
     cache_utils_installed = False
+
+
+ATTN_FALLBACK_ORDER = {
+    "flash_attention_2": ["flash_attention_2", "sdpa", "eager"],
+    "sdpa": ["sdpa", "eager"],
+    "eager": ["eager"],
+}
 
 
 class RabbitLLMBaseModel(GenerationMixin):
@@ -47,7 +60,8 @@ class RabbitLLMBaseModel(GenerationMixin):
 
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=torch.float16, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
-                 hf_token=None, prefetching=True, delete_original=False):
+                 hf_token=None, prefetching=True, delete_original=False,
+                 attn_implementation="auto"):
         """
         Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
         During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
@@ -71,6 +85,11 @@ class RabbitLLMBaseModel(GenerationMixin):
             setting to '4bit' or '8bit' to enable compression from 16 bits to 4 bits/8 bits which speeed up 4x or 2x inference time with a tiny accuracy loss.
         hf_token: str, optional
             huggingface api token could be provided, by default None
+        attn_implementation: str, optional
+            attention implementation to use. Options: "auto" (detect best available),
+            "flash_attention_2" (requires flash-attn and Ampere+ GPU),
+            "sdpa" (PyTorch scaled dot-product attention),
+            "eager" (default HuggingFace attention). By default "auto".
         """
 
 
@@ -82,6 +101,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         self.total_compression_overhead_time = None
         self._supports_cache_class = False
         self.hf_quantizer = None
+        self.attn_implementation = attn_implementation
 
         if compression is not None:
             if not bitsandbytes_installed:
@@ -142,7 +162,7 @@ class RabbitLLMBaseModel(GenerationMixin):
 
         if self.compression is not None:
             self.prefetching = False
-            print(f"not support prefetching for compression for now. loading with no prepetching mode.")
+            logger.info("Prefetching not supported with compression. Loading without prefetching.")
 
         # this operation should run only if gpu is available
         if prefetching and device.startswith("cuda"):
@@ -166,46 +186,88 @@ class RabbitLLMBaseModel(GenerationMixin):
         else:
             return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
 
-    def get_use_better_transformer(self):
-        return True
+    def _resolve_attn_implementation(self):
+        """Resolve the best attention implementation to use."""
+        if self.attn_implementation != "auto":
+            return self.attn_implementation
+
+        # FlashAttention 2 requires fp16 or bf16
+        if self.running_dtype not in (torch.float16, torch.bfloat16):
+            logger.info(
+                "dtype %s is not compatible with FlashAttention 2 (requires fp16/bf16). Using SDPA.",
+                self.running_dtype,
+            )
+            return "sdpa"
+
+        flash_ok, flash_msg = is_flash_attention_available()
+        if flash_ok:
+            logger.info(flash_msg)
+            return "flash_attention_2"
+
+        logger.info("FlashAttention not available: %s. Using SDPA.", flash_msg)
+        return "sdpa"
+
+    def _create_model_from_config(self, **extra_kwargs):
+        """Create a meta model, suppressing noisy output from third-party model code (e.g. QWen).
+
+        Some model implementations (notably QWen v1) emit flash-attn import warnings
+        via print(), logging, and warnings on every instantiation. We suppress all three
+        channels during model creation to keep output clean.
+        """
+        devnull = io.StringIO()
+        with init_empty_weights(), \
+             contextlib.redirect_stdout(devnull), \
+             contextlib.redirect_stderr(devnull), \
+             warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # Temporarily raise the logging level for all loggers to suppress
+            # noisy INFO/WARNING messages from third-party model code.
+            root_logger = logging.getLogger()
+            prev_level = root_logger.level
+            root_logger.setLevel(logging.ERROR)
+            try:
+                return AutoModelForCausalLM.from_config(
+                    self.config, trust_remote_code=True, **extra_kwargs
+                )
+            finally:
+                root_logger.setLevel(prev_level)
 
     def init_model(self):
-
-        # try way 1 better transformers...
-        # Load meta model (no memory used)
         self.model = None
 
-        if self.get_use_better_transformer():
+        # On the first call we discover which attn impl works; after that reuse it directly.
+        if hasattr(self, "_active_attn_implementation"):
             try:
-                with init_empty_weights():
-                    self.model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=True)
-                    self.model = BetterTransformer.transform(self.model)  # enable flash attention
-            except ValueError as ve:
-                del self.model
-                clean_memory()
+                if self._active_attn_implementation == "eager":
+                    self.model = self._create_model_from_config()
+                else:
+                    self.model = self._create_model_from_config(
+                        attn_implementation=self._active_attn_implementation,
+                    )
+            except (ValueError, TypeError):
                 self.model = None
 
-            if self.model is None:
-                # try way 2.
+        if self.model is None:
+            resolved_attn = self._resolve_attn_implementation()
+            fallback_chain = ATTN_FALLBACK_ORDER.get(resolved_attn, ["sdpa", "eager"])
+
+            for impl in fallback_chain:
                 try:
-
-                    print(f"new version of transfomer, no need to use BetterTransformer, try setting attn impl to sdpa...")
-                    self.config.attn_implementation = "sdpa"
-
-                    with init_empty_weights():
-                        self.model = AutoModelForCausalLM.from_config(self.config, attn_implementation="sdpa", trust_remote_code=True)
-                    print(f"attn imp: {type(self.model.model.layers[3].self_attn)}")
-
-                except TypeError as ve:
-                    del self.model
+                    self.model = self._create_model_from_config(attn_implementation=impl)
+                    self._active_attn_implementation = impl
+                    logger.info("Model initialized with attn_implementation='%s'", impl)
+                    break
+                except (ValueError, TypeError) as e:
+                    logger.info("attn_implementation='%s' not supported for this model, trying next.", impl)
+                    if self.model is not None:
+                        del self.model
                     clean_memory()
                     self.model = None
 
-        # fallback to original way
         if self.model is None:
-            print(f"either BetterTransformer or attn_implementation='sdpa' is available, creating model directly")
-            with init_empty_weights():
-                self.model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=True)
+            self.model = self._create_model_from_config()
+            self._active_attn_implementation = "eager"
+            logger.info("Model initialized with default (eager) attention")
 
         quantization_config = getattr(self.config, "quantization_config", None)
 
@@ -282,7 +344,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                     state_dict[k].pin_memory()
             else:
                 # For CPU, no action is needed, but you could optionally add a log or message
-                print("Prefetching is enabled, but no pin_memory operation is needed for CPU.")
+                logger.debug("Prefetching is enabled, but no pin_memory operation is needed for CPU.")
 
             elapsed_time = time.time() - t
             if self.profiling_mode:
@@ -371,6 +433,8 @@ class RabbitLLMBaseModel(GenerationMixin):
         return {'past_key_value': (k_cache, v_cache)}
 
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s):
+        if self._active_attn_implementation == "flash_attention_2":
+            return {'attention_mask': full_attention_mask}
         return {'attention_mask': full_attention_mask[:, :, -len_s:, -len_p - len_s:]}
 
     def get_position_ids_args(self, full_position_ids, len_p, len_s):
@@ -412,10 +476,15 @@ class RabbitLLMBaseModel(GenerationMixin):
         batch = [input_ids_unit.to(self.running_device).unsqueeze(0) for input_ids_unit in input_ids]
         n_seq = len(batch[0])
 
-        # Create attention mask for the largest input, and position ids to use KV cache
-        attention_mask = torch.ones(self.max_seq_len, self.max_seq_len)
-        attention_mask = attention_mask.triu(diagonal=1)[None, None, ...] == 0
-        attention_mask = attention_mask.to(self.running_device)
+        # Create attention mask for the largest input, and position ids to use KV cache.
+        # FlashAttention 2 handles causality internally and expects a 2D mask (batch, seq_len).
+        # SDPA/eager require a 4D causal mask.
+        if self._active_attn_implementation == "flash_attention_2":
+            attention_mask = torch.ones(1, self.max_seq_len, dtype=torch.long, device=self.running_device)
+        else:
+            attention_mask = torch.ones(self.max_seq_len, self.max_seq_len)
+            attention_mask = attention_mask.triu(diagonal=1)[None, None, ...] == 0
+            attention_mask = attention_mask.to(self.running_device)
         position_ids = torch.arange(self.max_seq_len, dtype=torch.long, device=self.running_device)[None, :]
 
         kv_cache_list = [] if use_cache else None
@@ -547,18 +616,14 @@ class RabbitLLMBaseModel(GenerationMixin):
 
                             if not use_cache:
 
-                                kwargs = {'use_cache': False,
-                                          'attention_mask': attention_mask[:, :, -len_seq:, -len_seq:],
-                                          }
+                                kwargs = {'use_cache': False}
                                 kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
 
 
                                 new_seq = layer(seq, **kwargs)[0]
                             else:
 
-                                kwargs = {'use_cache': True,
-                                          'attention_mask': attention_mask[:, :, -len_seq:, -len_seq:],
-                                          }
+                                kwargs = {'use_cache': True}
                                 kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
 
                                 layer_out = layer(seq, **kwargs)
@@ -615,8 +680,8 @@ class RabbitLLMBaseModel(GenerationMixin):
             self.profiler.print_profiling_time()
 
 
-            print(f"total infer process time(including all above plus gpu compute): {forward_elapsed_time:.04f}")
-            print(f"total infer wall time(including all above plus gpu compute): {forward_elapsed_time_wall:.04f}")
+            logger.info("total infer process time(including all above plus gpu compute): %.04f", forward_elapsed_time)
+            logger.info("total infer wall time(including all above plus gpu compute): %.04f", forward_elapsed_time_wall)
 
             self.profiler.clear_profiling_time()
 

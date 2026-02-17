@@ -1,5 +1,6 @@
 import gc
 import json
+import logging
 import os
 import ctypes
 import shutil
@@ -24,6 +25,7 @@ from safetensors.torch import load_file, save_file
 
 from .persist import ModelPersister
 
+logger = logging.getLogger(__name__)
 
 try:
     import bitsandbytes as bnb
@@ -34,6 +36,38 @@ except ImportError:
 
 
 import huggingface_hub
+
+
+def is_flash_attention_available():
+    """Check if flash-attn is installed and GPU supports it (Ampere+, SM >= 80).
+
+    Returns
+    -------
+    available : bool
+        Whether FlashAttention 2 can be used.
+    message : str
+        Human-readable explanation of the result.
+    """
+    try:
+        import flash_attn  # noqa: F401
+        flash_installed = True
+    except ImportError:
+        flash_installed = False
+
+    if not flash_installed:
+        return False, "flash-attn package is not installed"
+
+    if not torch.cuda.is_available():
+        return False, "CUDA is not available"
+
+    device_cap = torch.cuda.get_device_capability()
+    if device_cap[0] < 8:
+        return False, (
+            f"GPU {torch.cuda.get_device_name()} has compute capability "
+            f"{device_cap[0]}.{device_cap[1]}, but FlashAttention 2 requires >= 8.0 (Ampere+)"
+        )
+
+    return True, f"FlashAttention 2 available on {torch.cuda.get_device_name()}"
 
 
 # replacement for bnb quantstat.as_dict(True), until the bug is fixed....
