@@ -242,7 +242,7 @@ model.tokenizer.decode(generation_output.sequences[0])
 Technical notes for developers and contributors:
 
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Design: relationship with HuggingFace, tied weights and `lm_head`, KV cache (DynamicCache), attention implementations (eager, SDPA, FlashAttention 2).
-- **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)** — Transformers version (4.44–4.46), model compatibility matrix, single-file checkpoints.
+- **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)** — Transformers version (4.47–4.49), model compatibility matrix, single-file checkpoints.
 - **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — Common issues (zero logits, attention mask, cache errors) and how to debug.
 
 ## Acknowledgement
