@@ -64,6 +64,35 @@ Common issues and how they were addressed in the codebase.
 
 **Fix**: In `utils.split_and_save_layers()` and `find_or_create_local_splitted_path()`, detect the single-file case (no index, or only `model.safetensors`), and use `safetensors.safe_open` / the list of keys to build the layer list and split or load accordingly.
 
+## Speeding up inference (responses in seconds)
+
+To get the lowest latency per token:
+
+1. **Attention**: The fastest option depends on GPU and model size. Try `"eager"`, `"sdpa"`, or default `"auto"` (SDPA or Flash if available); on small models or some GPUs, `"eager"` can be faster. For large models on Ampere+ GPUs, `"flash_attention_2"` or `"auto"` often wins.
+
+2. **Prefetch**: Prefetching is on by default and overlaps loading the next layer from disk with the current layer’s forward pass. Do not pass `prefetching=False` when loading the model.
+
+3. **Compression trade-off**: If you use `compression='4bit'` or `'8bit'`, prefetching is **disabled** in the code (see `rabbitllm_base.py`). For lowest latency, try **without** compression first; prefetch often outweighs the benefit of smaller layer files. Use compression when disk I/O is the clear bottleneck and you have measured it via `profiling_mode=True`.
+
+4. **Disk and model size**: Keep the split model on a fast **local SSD** (Hugging Face cache or `layer_shards_saving_path`). Use smaller models (e.g. 0.5B–7B) for “response in seconds”; 70B will always be slower due to layer count.
+
+### Finding the bottleneck with the profiler
+
+Load the model with `profiling_mode=True`:
+
+```python
+model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", profiling_mode=True)
+```
+
+After a `generate()` call, the profiler prints total time per category:
+
+- **load_safe_tensor** — time loading layer data from disk. If this dominates, use an SSD or consider compression to reduce I/O size.
+- **create_layer_from_state_dict** — time copying layer weights from CPU to VRAM. If this dominates, consider the Fase 3 optimization (second CUDA stream or non_blocking copy).
+- **forward_per_layer** — time spent in the actual forward pass per layer. If this dominates, use SDPA or Flash (see point 1 above).
+- **load_safe_tensor_cpu_wait** — time waiting for the prefetched layer to be ready (should be low when prefetch overlaps well with compute).
+
+Use these to decide whether to optimize disk I/O, CPU→VRAM copy, or attention implementation.
+
 ## Debugging forward vs HuggingFace
 
 To check whether layer-streaming matches standard HuggingFace:

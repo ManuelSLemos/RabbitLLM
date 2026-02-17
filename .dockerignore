@@ -1,45 +1,33 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
+# Git and IDE
+.git
+.gitignore
+.cursor
+*.md
+!README.md
+
+# Python
+__pycache__
 *.py[cod]
 *$py.class
-
-# Environments
-.env
+*.so
 .venv
+venv
+env
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+.eggs
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.coverage
-.coverage.*
+# Cache and local data
 .cache
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
-.pytest_cache/
+*.lock
+uv.lock
 
-# IDE specific files
-.idea/
-.vscode/
-*.swp
-*.swo
+# Docs/plans (optional; uncomment to keep in image)
+# .cursor/plans
+# docs
+# PLAN.md
+
+# Tests (keep if you want to run tests in container)
+# src/tests

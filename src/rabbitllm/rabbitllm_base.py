@@ -653,6 +653,8 @@ class RabbitLLMBaseModel(GenerationMixin):
                             value=embed_state_dict[embed_key], dtype=self.running_dtype)
 
                 # Run layer
+                if self.profiling_mode:
+                    _forward_layer_start = time.time()
 
                 for j, seq in enumerate(batch):
 
@@ -739,6 +741,9 @@ class RabbitLLMBaseModel(GenerationMixin):
 
                 layer.to("meta")
                 clean_memory()  # proposed by CPMP
+
+                if self.profiling_mode:
+                    self.profiler.add_profiling_time('forward_per_layer', time.time() - _forward_layer_start)
 
         logits = torch.cat(batch, 0)
         if use_cache:
