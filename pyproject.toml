@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "airllm"
+version = "2.11.0"
+description = "AirLLM allows single 4GB GPU card to run 70B large language models without quantization, distillation or pruning. 8GB vmem to run 405B Llama3.1."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Gavin Li", email = "gavinli@animaai.cloud" }
+]
+urls = { Homepage = "https://github.com/lyogavin/airllm" }
+requires-python = ">=3.10"
+dependencies = [
+    "tqdm",
+    "torch>=2.0",
+    "transformers==4.38.2",
+    "accelerate>=0.25",
+    "safetensors>=0.4",
+    "optimum==1.17.0",
+    "huggingface-hub>=0.20",
+    "scipy",
+    "transformers-stream-generator>=0.0.5",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+compression = ["bitsandbytes"]
+server = []
+dev = ["ruff", "pytest", "mypy"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["air_llm/airllm"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["air_llm/tests"]
+pythonpath = ["."]
