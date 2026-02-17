@@ -16,14 +16,15 @@ requires-python = ">=3.10"
 dependencies = [
     "tqdm",
     "torch>=2.0",
-    "transformers==4.38.2",
-    "accelerate>=0.25",
+    "transformers>=4.44,<4.47",
+    "accelerate>=0.26",
     "safetensors>=0.4",
     "huggingface-hub>=0.20",
     "scipy",
     "transformers-stream-generator>=0.0.5",
     "tiktoken>=0.12.0",
     "einops>=0.8.2",
+    "sentencepiece>=0.1.99",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

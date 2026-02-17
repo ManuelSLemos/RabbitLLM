@@ -58,7 +58,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                        'lm_head': 'lm_head',}
 
 
-    def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=torch.float16, max_seq_len=512,
+    def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=None, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, delete_original=False,
                  attn_implementation="auto"):
@@ -74,7 +74,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         device : str, optional
             device, by default "cuda:0"
         dtype : torch.dtype, optional
-            dtype, by default torch.float16
+            dtype, by default auto-detected from model config (falls back to torch.float16)
         max_seq_len : int, optional
             max seq lenght, by default 512
         layer_shards_saving_path : str, optional
@@ -124,14 +124,23 @@ class RabbitLLMBaseModel(GenerationMixin):
                                                                                          delete_original=delete_original)
         self.running_device = device
         self.device = torch.device(self.running_device)
-        self.running_dtype = dtype
-        self.dtype = self.running_dtype
 
         # Create model
         if hf_token is not None:
             self.config = AutoConfig.from_pretrained(self.model_local_path, token=hf_token, trust_remote_code=True)
         else:
             self.config = AutoConfig.from_pretrained(self.model_local_path, trust_remote_code=True)
+
+        # Resolve dtype: user-specified > model config > float16 fallback
+        if dtype is None:
+            config_dtype = getattr(self.config, 'torch_dtype', None)
+            if config_dtype is not None and isinstance(config_dtype, torch.dtype):
+                dtype = config_dtype
+                logger.info("Auto-detected dtype from model config: %s", dtype)
+            else:
+                dtype = torch.float16
+        self.running_dtype = dtype
+        self.dtype = self.running_dtype
 
         self.generation_config = self.get_generation_config()
         #print(f"using generation_config: {self.generation_config}")
@@ -238,12 +247,9 @@ class RabbitLLMBaseModel(GenerationMixin):
         # On the first call we discover which attn impl works; after that reuse it directly.
         if hasattr(self, "_active_attn_implementation"):
             try:
-                if self._active_attn_implementation == "eager":
-                    self.model = self._create_model_from_config()
-                else:
-                    self.model = self._create_model_from_config(
-                        attn_implementation=self._active_attn_implementation,
-                    )
+                self.model = self._create_model_from_config(
+                    attn_implementation=self._active_attn_implementation,
+                )
             except (ValueError, TypeError):
                 self.model = None
 
@@ -265,7 +271,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                     self.model = None
 
         if self.model is None:
-            self.model = self._create_model_from_config()
+            self.model = self._create_model_from_config(attn_implementation="eager")
             self._active_attn_implementation = "eager"
             logger.info("Model initialized with default (eager) attention")
 
@@ -277,7 +283,10 @@ class RabbitLLMBaseModel(GenerationMixin):
             self.hf_quantizer.preprocess_model(model = self.model, device_map = device_map)
 
         self.model.eval()
-        self.model.tie_weights()
+        # NOTE: do NOT call tie_weights() here. In the layer-streaming architecture,
+        # each layer's weights are loaded independently from disk. tie_weights() would
+        # make lm_head.weight reference embed_tokens.weight (both on meta device), and
+        # when embed_tokens is loaded, the tie breaks — leaving lm_head on meta.
 
         self.set_layers_from_layer_names()
 
@@ -426,6 +435,72 @@ class RabbitLLMBaseModel(GenerationMixin):
     def get_sequence_len(self, seq):
         return seq.shape[1]
 
+    @property
+    def _uses_cache_objects(self):
+        """Whether the model uses Cache objects (DynamicCache) instead of legacy tuples.
+
+        In transformers >= 4.36, all attention implementations (eager, sdpa, flash)
+        expect a Cache object for past_key_value and return None when none is provided.
+        """
+        return cache_utils_installed
+
+    @contextlib.contextmanager
+    def _layer_idx_as_zero(self, layer):
+        """Temporarily set a decoder layer's attention layer_idx to 0.
+
+        In the layer-streaming architecture we process one layer at a time, so
+        DynamicCache always operates on a single-entry cache. The attention
+        module stores its real layer_idx (e.g. 15 for the 15th layer) which
+        causes an IndexError on a fresh/small DynamicCache. This context
+        manager resets it to 0 for the duration of the call and restores it
+        afterwards.
+        """
+        attn = getattr(layer, 'self_attn', None)
+        original_idx = None
+        if attn is not None and hasattr(attn, 'layer_idx'):
+            original_idx = attn.layer_idx
+            attn.layer_idx = 0
+        try:
+            yield
+        finally:
+            if original_idx is not None:
+                attn.layer_idx = original_idx
+
+    def _extract_kv_from_layer_output(self, layer_out, output_attentions=False):
+        """Extract (hidden_states, k_cache, v_cache) from a decoder layer output.
+
+        Handles both legacy tuple format (eager) and Cache objects (SDPA/FA2).
+        """
+        hidden_states = layer_out[0]
+        cache_idx = 2 if output_attentions else 1
+        cache_data = layer_out[cache_idx] if len(layer_out) > cache_idx else None
+
+        if cache_data is None:
+            return hidden_states, None, None
+
+        # Legacy tuple format: (key_states, value_states)
+        if isinstance(cache_data, tuple):
+            return hidden_states, cache_data[0], cache_data[1]
+
+        # DynamicCache or similar Cache object
+        if cache_utils_installed and isinstance(cache_data, Cache):
+            if len(cache_data.key_cache) > 0:
+                return hidden_states, cache_data.key_cache[-1], cache_data.value_cache[-1]
+            return hidden_states, None, None
+
+        return hidden_states, None, None
+
+    def _make_layer_past_kv_arg(self, k_cache=None, v_cache=None):
+        """Build the past_key_value argument appropriate for the attention implementation."""
+        if self._uses_cache_objects:
+            cache = DynamicCache()
+            if k_cache is not None and v_cache is not None:
+                cache.update(k_cache, v_cache, 0)
+            return {'past_key_value': cache}
+        if k_cache is not None and v_cache is not None:
+            return self.get_past_key_value_args(k_cache, v_cache)
+        return {}
+
     def get_pos_emb_args(self, len_p, len_s):
         return {}
 
@@ -435,6 +510,10 @@ class RabbitLLMBaseModel(GenerationMixin):
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s):
         if self._active_attn_implementation == "flash_attention_2":
             return {'attention_mask': full_attention_mask}
+        if self._active_attn_implementation == "sdpa":
+            # SDPA handles causal masking natively via is_causal=True when mask is None.
+            # Passing a manual mask can cause numerical issues (inf/nan).
+            return {'attention_mask': None}
         return {'attention_mask': full_attention_mask[:, :, -len_s:, -len_p - len_s:]}
 
     def get_position_ids_args(self, full_position_ids, len_p, len_s):
@@ -460,6 +539,7 @@ class RabbitLLMBaseModel(GenerationMixin):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
+            **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if self.profiling_mode:
@@ -477,14 +557,22 @@ class RabbitLLMBaseModel(GenerationMixin):
         n_seq = len(batch[0])
 
         # Create attention mask for the largest input, and position ids to use KV cache.
-        # FlashAttention 2 handles causality internally and expects a 2D mask (batch, seq_len).
-        # SDPA/eager require a 4D causal mask.
+        # - FlashAttention 2: expects a 2D mask (batch, seq_len), handles causality internally.
+        # - SDPA: handles causality natively (is_causal=True) when mask is None, so no mask needed.
+        # - Eager: requires a 4D causal mask.
         if self._active_attn_implementation == "flash_attention_2":
             attention_mask = torch.ones(1, self.max_seq_len, dtype=torch.long, device=self.running_device)
+        elif self._active_attn_implementation == "sdpa":
+            attention_mask = None
         else:
-            attention_mask = torch.ones(self.max_seq_len, self.max_seq_len)
-            attention_mask = attention_mask.triu(diagonal=1)[None, None, ...] == 0
-            attention_mask = attention_mask.to(self.running_device)
+            # Eager attention uses additive masking: 0.0 = attend, large negative = ignore.
+            attention_mask = torch.full(
+                (self.max_seq_len, self.max_seq_len),
+                torch.finfo(self.running_dtype).min,
+                dtype=self.running_dtype,
+                device=self.running_device,
+            )
+            attention_mask = torch.triu(attention_mask, diagonal=1)[None, None, ...]
         position_ids = torch.arange(self.max_seq_len, dtype=torch.long, device=self.running_device)[None, :]
 
         kv_cache_list = [] if use_cache else None
@@ -551,6 +639,19 @@ class RabbitLLMBaseModel(GenerationMixin):
                         elapsed_time = time.time() - t
                         self.profiler.add_profiling_time('create_layer_from_safe_tensor', elapsed_time)
 
+                # Handle tied weights: if lm_head split was empty (tie_word_embeddings),
+                # load the embedding weight as the lm_head weight.
+                if (layer_name == self.layer_names_dict['lm_head']
+                        and len(state_dict) == 0
+                        and getattr(self.config, 'tie_word_embeddings', False)):
+                    embed_state_dict = self.load_layer_to_cpu(self.layer_names_dict['embed'])
+                    embed_key = self.layer_names_dict['embed'] + '.weight'
+                    lm_head_key = self.layer_names_dict['lm_head'] + '.weight'
+                    if embed_key in embed_state_dict:
+                        set_module_tensor_to_device(
+                            self.model, lm_head_key, self.running_device,
+                            value=embed_state_dict[embed_key], dtype=self.running_dtype)
+
                 # Run layer
 
                 for j, seq in enumerate(batch):
@@ -578,62 +679,50 @@ class RabbitLLMBaseModel(GenerationMixin):
 
                             position_ids_args = self.get_position_ids_args(position_ids, len_p, len_s)
                             attention_mask_args = self.get_attention_mask_args(attention_mask, len_p, len_s)
-                            past_key_value_args = self.get_past_key_value_args(k_cache, v_cache)
+                            past_key_value_args = self._make_layer_past_kv_arg(k_cache, v_cache)
 
-                            kwargs = {'use_cache':True,
-                                      }
+                            kwargs = {'use_cache': True}
 
                             pos_embed_args = self.get_pos_emb_args(len_p, len_s)
                             kwargs = {**kwargs, **past_key_value_args, **pos_embed_args, **attention_mask_args,
                                       **position_ids_args}
 
-
-                            layer_outputs = layer(seq,
-                                                  **kwargs
-                                                  )
+                            with self._layer_idx_as_zero(layer):
+                                layer_outputs = layer(seq, **kwargs)
                             new_seq = layer_outputs[0]
 
                             if output_attentions:
                                 all_self_attns[i].append(layer_outputs[1])
 
                             if use_cache:
-                                (k_cache, v_cache) = layer_outputs[2 if output_attentions else 1]
-                                kv_cache_list[i][0].append(k_cache)
-                                kv_cache_list[i][1].append(v_cache)
-
+                                _, k_cache, v_cache = self._extract_kv_from_layer_output(
+                                    layer_outputs, output_attentions=output_attentions)
+                                if k_cache is not None:
+                                    kv_cache_list[i][0].append(k_cache)
+                                    kv_cache_list[i][1].append(v_cache)
 
                         else:
                             len_seq = self.get_sequence_len(seq)
-
-
 
                             pos_embed_args = self.get_pos_emb_args(0, len_seq)
                             attention_mask_args = self.get_attention_mask_args(attention_mask, 0, len_seq)
                             position_ids_args = self.get_position_ids_args(position_ids, 0, len_seq)
 
-
-
-
                             if not use_cache:
-
                                 kwargs = {'use_cache': False}
                                 kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
-
-
                                 new_seq = layer(seq, **kwargs)[0]
                             else:
-
+                                past_kv_args = self._make_layer_past_kv_arg()
                                 kwargs = {'use_cache': True}
-                                kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
+                                kwargs = {**kwargs, **past_kv_args, **pos_embed_args, **attention_mask_args, **position_ids_args}
 
-                                layer_out = layer(seq, **kwargs)
-
-                                # TODO: adopt Cache mechanism in 4.36
-                                new_seq, (k_cache, v_cache) = layer_out
-                                kv_cache_list[i][0].append(k_cache)
-                                kv_cache_list[i][1].append(v_cache)
-
-                                # print(f"k_cache sizes: {[len(x[1]) for x in kv_cache_list]}")
+                                with self._layer_idx_as_zero(layer):
+                                    layer_out = layer(seq, **kwargs)
+                                new_seq, k_cache, v_cache = self._extract_kv_from_layer_output(layer_out)
+                                if k_cache is not None:
+                                    kv_cache_list[i][0].append(k_cache)
+                                    kv_cache_list[i][1].append(v_cache)
 
                         batch[j] = new_seq
 
