@@ -3,7 +3,7 @@ from rabbitllm import AutoModel
 MAX_LENGTH = 128
 MAX_NEW_TOKENS = 50
 
-model = AutoModel.from_pretrained("Qwen/Qwen-7B")
+model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
 
 print("Modelo cargado. Escribe 'exit' para salir.\n")
 
