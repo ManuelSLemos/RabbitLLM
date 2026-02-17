@@ -398,10 +398,6 @@ class RabbitLLMBaseModel(GenerationMixin):
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
-        if cache_utils_installed:
-            # we don't support kv cache for new version yet
-            use_cache = False
-
         if self.profiling_mode:
             self.profiler.clear_profiling_time()
 
