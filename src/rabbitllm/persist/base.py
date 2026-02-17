@@ -1,7 +1,7 @@
 
 
-
 model_persister = None
+
 
 class ModelPersister:
     def __init__(self):
@@ -13,19 +13,14 @@ class ModelPersister:
         if model_persister is not None:
             return model_persister
 
-
         from sys import platform
-        is_on_mac_os = False
-
-        if platform == "darwin":
-            is_on_mac_os = True
-
+        is_on_mac_os = platform == "darwin"
 
         if is_on_mac_os:
-            from .mlx_model_persister import MlxModelPersister
+            from .mlx import MlxModelPersister
             model_persister = MlxModelPersister()
         else:
-            from .safetensor_model_persister import SafetensorModelPersister
+            from .safetensor import SafetensorModelPersister
             model_persister = SafetensorModelPersister()
         return model_persister
 

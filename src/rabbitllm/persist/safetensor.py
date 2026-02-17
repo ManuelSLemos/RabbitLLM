@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from .model_persister import ModelPersister
+from .base import ModelPersister
 from safetensors.torch import load_file, save_file
 
 

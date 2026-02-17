@@ -1,26 +1,22 @@
-import sys
 import unittest
 
 import torch
-sys.path.insert(0, '../rabbitllm')
 
 from rabbitllm import compress_layer_state_dict, uncompress_layer_state_dict
-
-
 
 
 class TestCompression(unittest.TestCase):
     def setUp(self):
         pass
+
     def tearDown(self):
         pass
 
     def test_should_compress_uncompress(self):
-        #torch.manual_seed(0)
         a0 = torch.normal(0, 1, (32, 128), dtype=torch.float16).cuda()
         a1 = torch.normal(0, 1, (32, 128), dtype=torch.float16).cuda()
 
-        a_state_dict = {'a0':a0, 'a1':a1}
+        a_state_dict = {'a0': a0, 'a1': a1}
 
         loss_fn = torch.nn.MSELoss()
 
@@ -29,7 +25,7 @@ class TestCompression(unittest.TestCase):
                 b = compress_layer_state_dict(a_state_dict, compression)
 
                 if iloop < 2:
-                    print(f"for compression {compression}, compressed to: { {k:v.shape for k,v in b.items()} }")
+                    print(f"for compression {compression}, compressed to: { {k: v.shape for k, v in b.items()} }")
 
                 aa = uncompress_layer_state_dict(b)
 

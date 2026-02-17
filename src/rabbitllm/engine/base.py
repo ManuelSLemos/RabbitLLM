@@ -16,10 +16,9 @@ from accelerate import init_empty_weights
 from accelerate.utils.modeling import set_module_tensor_to_device
 from transformers.quantizers import AutoHfQuantizer, HfQuantizer
 
-from .profiler import LayeredProfiler
+from ..profiler import LayeredProfiler
 
-
-from .utils import clean_memory, load_layer, \
+from ..utils import clean_memory, load_layer, \
     find_or_create_local_splitted_path, is_flash_attention_available
 
 logger = logging.getLogger(__name__)

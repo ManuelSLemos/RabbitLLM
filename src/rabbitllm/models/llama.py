@@ -1,4 +1,4 @@
-from .rabbitllm_base import RabbitLLMBaseModel
+from ..engine.base import RabbitLLMBaseModel
 
 
 class RabbitLLMLlama2(RabbitLLMBaseModel):

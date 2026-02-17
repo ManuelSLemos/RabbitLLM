@@ -5,7 +5,7 @@ MAX_LENGTH = 128
 
 # eager is often faster on small models/some GPUs; try "auto" or "sdpa" to compare
 t0 = time.perf_counter()
-model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", attn_implementation="flash_attention_2")
+model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
 load_s = time.perf_counter() - t0
 print(f"[time] model load: {load_s:.2f}s")
 

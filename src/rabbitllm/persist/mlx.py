@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 import mlx.core as mx
-from .model_persister import ModelPersister
+from .base import ModelPersister
 from mlx.utils import tree_unflatten
 import torch
 
@@ -49,9 +49,6 @@ def map_torch_to_mlx(model):
     model = {k.replace("o_proj", "wo"): v for k, v in model.items()}
 
 
-    #weights = {k: v.to(torch.float16).numpy() for k, v in model.items()}
-
-
     return model
 
 class MlxModelPersister(ModelPersister):
@@ -70,42 +67,28 @@ class MlxModelPersister(ModelPersister):
         safetensor_exists = os.path.exists(str(saving_path / (layer_name + 'mlx.npz')))
         done_marker_exists = os.path.exists(str(saving_path / (layer_name + 'mlx.done')))
 
-        #print(f"checking {layer_name}, {saving_path} - {safetensor_exists},{done_marker_exists}")
-
         return safetensor_exists and done_marker_exists
 
     def persist_model(self, state_dict, layer_name, saving_path):
-        #save_file(state_dict, saving_path / (layer_name + 'safetensors'))
         weights = {k: v.to(torch.float16).numpy() for k, v in state_dict.items()}
         np.savez(
             saving_path / (layer_name + 'mlx'),
-            **weights#map_torch_to_mlx(state_dict)
+            **weights
         )
 
         print(f"saved as: {saving_path / (layer_name + 'mlx')}")
 
-        # set done marker
         (saving_path / (layer_name + 'mlx.done')).touch()
 
 
     def load_model(self, layer_name, path):
         try:
             to_load_path = Path(path) / (layer_name + ".mlx.npz")
-            #available = psutil.virtual_memory().available / 1024 / 1024
-            #print(f"start loading: {to_load_path}, before loading: {available:.02f}")
             layer_state_dict = mx.load(str(to_load_path))
-            #available = psutil.virtual_memory().available / 1024 / 1024
-            #print(f"loaded {layer_name}, available mem: {available:.02f}")
 
             layer_state_dict = map_torch_to_mlx(layer_state_dict)
 
             weights = tree_unflatten(list(layer_state_dict.items()))
-
-            #for el in layer_name.split("."):
-            #    if len(el) > 0:
-            #        if el.isdigit():
-            #            el = int(el)
-            #        weights = weights[el]
 
             return weights
         except Exception as ex:

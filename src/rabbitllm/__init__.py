@@ -1,24 +1,23 @@
-from sys import platform
+from .utils.platform import is_on_mac_os
 
-is_on_mac_os = False
-
-if platform == "darwin":
-    is_on_mac_os = True
+from .utils import (
+    split_and_save_layers,
+    NotEnoughSpaceException,
+    compress_layer_state_dict,
+    uncompress_layer_state_dict,
+)
 
 if is_on_mac_os:
-    from .rabbitllm_llama_mlx import RabbitLLMLlamaMlx
-    from .auto_model import AutoModel
+    from .engine.mlx_engine import RabbitLLMLlamaMlx
+    from .models.registry import AutoModel
 else:
-    from .rabbitllm import RabbitLLMLlama2
-    from .rabbitllm_chatglm import RabbitLLMChatGLM
-    from .rabbitllm_qwen import RabbitLLMQWen
-    from .rabbitllm_qwen2 import RabbitLLMQWen2
-    from .rabbitllm_baichuan import RabbitLLMBaichuan
-    from .rabbitllm_internlm import RabbitLLMInternLM
-    from .rabbitllm_mistral import RabbitLLMMistral
-    from .rabbitllm_mixtral import RabbitLLMMixtral
-    from .rabbitllm_base import RabbitLLMBaseModel
-    from .auto_model import AutoModel
-    from .utils import split_and_save_layers
-    from .utils import NotEnoughSpaceException
-
+    from .engine.base import RabbitLLMBaseModel
+    from .models.registry import AutoModel
+    from .models.llama import RabbitLLMLlama2
+    from .models.chatglm import RabbitLLMChatGLM
+    from .models.qwen import RabbitLLMQWen
+    from .models.qwen2 import RabbitLLMQWen2
+    from .models.baichuan import RabbitLLMBaichuan
+    from .models.internlm import RabbitLLMInternLM
+    from .models.mistral import RabbitLLMMistral
+    from .models.mixtral import RabbitLLMMixtral

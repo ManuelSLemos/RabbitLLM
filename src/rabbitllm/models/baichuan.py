@@ -1,7 +1,7 @@
 from transformers import GenerationConfig
 
-from .rabbitllm_base import RabbitLLMBaseModel
-from .tokenization_baichuan import BaichuanTokenizer
+from ..engine.base import RabbitLLMBaseModel
+from ..compat.tokenization_baichuan import BaichuanTokenizer
 
 
 class RabbitLLMBaichuan(RabbitLLMBaseModel):

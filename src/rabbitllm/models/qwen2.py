@@ -1,5 +1,4 @@
-from .rabbitllm_base import RabbitLLMBaseModel
-
+from ..engine.base import RabbitLLMBaseModel
 
 
 class RabbitLLMQWen2(RabbitLLMBaseModel):
@@ -9,5 +8,3 @@ class RabbitLLMQWen2(RabbitLLMBaseModel):
 
 
         super(RabbitLLMQWen2, self).__init__(*args, **kwargs)
-
-

@@ -1,7 +1,7 @@
 
 from transformers import GenerationConfig
 
-from .rabbitllm_base import RabbitLLMBaseModel
+from ..engine.base import RabbitLLMBaseModel
 
 
 

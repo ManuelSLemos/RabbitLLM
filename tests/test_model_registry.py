@@ -1,15 +1,12 @@
-import sys
 import unittest
 
-#sys.path.insert(0, '../rabbitllm')
-
-from ..rabbitllm.auto_model import AutoModel
-
+from rabbitllm import AutoModel
 
 
 class TestAutoModel(unittest.TestCase):
     def setUp(self):
         pass
+
     def tearDown(self):
         pass
 
@@ -24,8 +21,6 @@ class TestAutoModel(unittest.TestCase):
             'mistralai/Mixtral-8x7B-v0.1': 'RabbitLLMMixtral'
         }
 
-
-        for k,v in mapping_dict.items():
-            module, cls = AutoModel.get_module_class(k)
+        for k, v in mapping_dict.items():
+            module_name, cls = AutoModel.get_module_class(k)
             self.assertEqual(cls, v, f"expecting {v}")
-
