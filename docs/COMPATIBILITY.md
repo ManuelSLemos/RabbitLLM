@@ -2,8 +2,8 @@
 
 ## Transformers version
 
-- **Supported**: `transformers>=4.47,<4.57` (e.g. 4.47.x through 4.56.x).
-- **Recommended**: Use the latest patch (e.g. 4.56.x) for the widest model support (Qwen3, DeepSeek V3, Gemma2/3, Phi3, Llama 3.2, etc.).
+- **Supported**: `transformers>=4.47,<4.58` (e.g. 4.47.x through 4.57.x).
+- **Recommended**: Use the latest patch (e.g. 4.56.x or 4.57.x) for the widest model support (Qwen3, DeepSeek V3, Gemma2/3, Phi3, Llama 3.2, etc.).
 
 In 4.50+, `GenerationMixin` may need to be imported from `transformers.generation.utils`; the codebase tries both import paths.
 
