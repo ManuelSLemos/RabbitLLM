@@ -14,6 +14,10 @@ Upgrading to 4.47 from 4.46 brings:
 - Cache utilities (`DynamicCache`) as the standard; our code uses them when available.
 - In 4.47+, `GenerationMixin` remains available via `from transformers import GenerationMixin`; no code change required for the base model.
 
+## Gated models
+
+Some repos (e.g. Meta Llama, certain Gemma variants) are gated. Use a Hugging Face token: pass `hf_token="hf_..."` to `from_pretrained()` or set the `HF_TOKEN` environment variable. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#gated-models-hugging-face).
+
 ## Dependencies
 
 - **accelerate** ≥ 0.26 (needed for transformers 4.46).

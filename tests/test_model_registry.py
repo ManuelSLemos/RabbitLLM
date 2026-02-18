@@ -14,6 +14,10 @@ class TestAutoModel(unittest.TestCase):
         mapping_dict = {
             "garage-bAInd/Platypus2-7B": "RabbitLLMLlama2",
             "Qwen/Qwen-7B": "RabbitLLMQWen",
+            "Qwen/Qwen2.5-0.5B-Instruct": "RabbitLLMQWen2",
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0": "RabbitLLMLlama2",
+            "microsoft/Phi-3-mini-4k-instruct": "RabbitLLMLlama2",
+            "google/gemma-2-2b-it": "RabbitLLMLlama2",
             "internlm/internlm-chat-7b": "RabbitLLMInternLM",
             "THUDM/chatglm3-6b-base": "RabbitLLMChatGLM",
             "baichuan-inc/Baichuan2-7B-Base": "RabbitLLMBaichuan",
@@ -23,4 +27,4 @@ class TestAutoModel(unittest.TestCase):
 
         for k, v in mapping_dict.items():
             module_name, cls = AutoModel.get_module_class(k)
-            self.assertEqual(cls, v, f"expecting {v}")
+            self.assertEqual(cls, v, f"expecting {v} for {k}")

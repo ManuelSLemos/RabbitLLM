@@ -93,6 +93,20 @@ After a `generate()` call, the profiler prints total time per category:
 
 Use these to decide whether to optimize disk I/O, CPU→VRAM copy, or attention implementation.
 
+## Gated models (Hugging Face)
+
+**Symptom**: `Cannot access gated repo` or `Access to model X is restricted. You must have access to it and be authenticated.`
+
+**Fix**: Models like `meta-llama/Llama-3.2-1B` or `meta-llama/Llama-2-7b-hf` require acceptance of the license on the Hub and a Hugging Face token.
+
+1. Accept the model’s license on [huggingface.co](https://huggingface.co) and create a token (Settings → Access tokens).
+2. Pass the token when using RabbitLLM:
+   - **Code**: `AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", hf_token="hf_...")`
+   - **Env**: `HF_TOKEN=hf_... python your_script.py` (scripts that read `os.environ.get("HF_TOKEN")` will use it).
+   - **CLI** (when available): `--token hf_...` or `HF_TOKEN=hf_... rabbit ...`.
+
+The token is forwarded to `AutoConfig.from_pretrained(..., token=...)`, model download, and tokenizer loading. Do not commit tokens; use env vars or a secrets manager.
+
 ## Debugging forward vs HuggingFace
 
 To check whether layer-streaming matches standard HuggingFace:
