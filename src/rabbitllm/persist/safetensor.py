@@ -1,7 +1,12 @@
+import logging
 import os
 from pathlib import Path
-from .base import ModelPersister
+
 from safetensors.torch import load_file, save_file
+
+from .base import ModelPersister
+
+logger = logging.getLogger(__name__)
 
 
 class SafetensorModelPersister(ModelPersister):
@@ -19,7 +24,7 @@ class SafetensorModelPersister(ModelPersister):
     def persist_model(self, state_dict, layer_name, saving_path):
         save_file(state_dict, saving_path / (layer_name + "safetensors"))
 
-        print(f"saved as: {saving_path / (layer_name + 'safetensors')}")
+        logger.debug("saved as: %s", saving_path / (layer_name + "safetensors"))
 
         # set done marker
         (saving_path / (layer_name + "safetensors.done")).touch()

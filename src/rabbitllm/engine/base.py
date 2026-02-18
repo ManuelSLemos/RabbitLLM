@@ -4,7 +4,8 @@ import time
 import warnings
 import torch
 
-from typing import List, Optional, Tuple, Union
+from pathlib import Path
+from typing import Any, List, Optional, Tuple, Union
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 from transformers import (
@@ -18,6 +19,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from accelerate.utils.modeling import set_module_tensor_to_device
 from transformers.quantizers import AutoHfQuantizer
 
+from ..persist import ModelPersister
 from ..profiler import LayeredProfiler
 from ..utils import (
     clean_memory,
@@ -25,6 +27,7 @@ from ..utils import (
     find_or_create_local_splitted_path,
     is_flash_attention_available,
 )
+from ..utils.platform import is_cuda_available
 from .attention import ATTN_FALLBACK_ORDER, resolve_attn_implementation, create_model_from_config
 from .model_init import create_model_with_attn_fallback
 from . import layer_loading as layer_loading_impl
@@ -55,7 +58,12 @@ except ImportError:
 
 
 class RabbitLLMBaseModel(GenerationMixin):
-    # customize layer names here
+    """Layer-streaming causal LM: loads one layer at a time to GPU, runs forward, frees memory.
+
+    Enables running 70B+ parameter models on 4GB VRAM without quantization. Subclass and override
+    set_layer_names_dict() for architecture-specific layer naming.
+    """
+
     def set_layer_names_dict(self):
         self.layer_names_dict = {
             "embed": "model.embed_tokens",
@@ -66,46 +74,37 @@ class RabbitLLMBaseModel(GenerationMixin):
 
     def __init__(
         self,
-        model_local_path_or_repo_id,
-        device="cuda:0",
-        dtype=None,
-        max_seq_len=512,
-        layer_shards_saving_path=None,
-        profiling_mode=False,
-        compression=None,
-        hf_token=None,
-        prefetching=True,
-        delete_original=False,
-        attn_implementation="auto",
-    ):
-        """
-        Sharded version of LlamaForCausalLM : the model is splitted into layer shards to reduce GPU memory usage.
-        During the forward pass, the inputs are processed layer by layer, and the GPU memory is freed after each layer.
-        To avoid loading the layers multiple times, we could save all the intermediate activations in RAM.
+        model_local_path_or_repo_id: Union[str, Path],
+        device: str = "cuda:0",
+        dtype: Optional[torch.dtype] = None,
+        max_seq_len: int = 512,
+        layer_shards_saving_path: Optional[Union[str, Path]] = None,
+        profiling_mode: bool = False,
+        compression: Optional[str] = None,
+        hf_token: Optional[str] = None,
+        prefetching: bool = True,
+        delete_original: bool = False,
+        attn_implementation: str = "auto",
+        persister: Optional[Any] = None,
+    ) -> None:
+        """Initialize the layer-streaming model from a checkpoint or HuggingFace repo.
 
-        Parameters
-        ----------
-        model_local_path_or_repo_id : str or Path
-            path to the local model checkpoint or huggingface repo id
-        device : str, optional
-            device, by default "cuda:0"
-        dtype : torch.dtype, optional
-            dtype, by default auto-detected from model config (falls back to torch.float16)
-        max_seq_len : int, optional
-            max seq lenght, by default 512
-        layer_shards_saving_path : str, optional
-            optional path to save layered shards model file, by default just save to the local cache of model, subdir named splitted_model will be saved
-        profiling_mode : book, optional
-            if to profile the model loading time, default to False
-        compression: str, optinal
-            setting to '4bit' or '8bit' to enable compression from 16 bits to 4 bits/8 bits which speeed up 4x or 2x inference time with a tiny accuracy loss.
-        hf_token: str, optional
-            huggingface api token could be provided, by default None
-        attn_implementation: str, optional
-            attention implementation to use. Options: "auto" (detect best available),
-            "flash_attention_2" (requires flash-attn and Ampere+ GPU),
-            "sdpa" (PyTorch scaled dot-product attention),
-            "eager" (default HuggingFace attention). By default "auto".
+        The model is split into layer shards; during forward, each layer is loaded to GPU,
+        run, then freed. Optional 4bit/8bit compression reduces VRAM further.
+
+        Args:
+            model_local_path_or_repo_id: Local path to checkpoint or HuggingFace repo ID.
+            device: Device string (e.g. "cuda:0"). Falls back to CPU if CUDA unavailable.
+            dtype: Torch dtype. Auto-detected from config if None (fallback float16).
+            max_seq_len: Maximum sequence length. Default 512.
+            layer_shards_saving_path: Where to save split layers. Default: model cache subdir.
+            profiling_mode: If True, record load/forward timing in self.profiler.
+            compression: "4bit" or "8bit" for quantized layers (requires bitsandbytes).
+            hf_token: HuggingFace token for gated repos.
+            prefetching: Overlap layer load with compute when CUDA available.
+            delete_original: If True, delete original checkpoint after splitting.
+            attn_implementation: "auto", "flash_attention_2", "sdpa", or "eager".
+            persister: Optional ModelPersister for layer I/O; default from get_model_persister().
         """
 
         self.profiling_mode = profiling_mode
@@ -127,6 +126,7 @@ class RabbitLLMBaseModel(GenerationMixin):
 
         self.compression = compression
         self.hf_token = hf_token
+        self._persister = persister if persister is not None else ModelPersister.get_model_persister()
 
         # Save parameters
 
@@ -149,7 +149,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                     category=UserWarning,
                 )
                 try:
-                    if not torch.cuda.is_available():
+                    if not is_cuda_available():
                         logger.warning("CUDA not available, using device='cpu'")
                         device = "cpu"
                     else:
@@ -319,7 +319,11 @@ class RabbitLLMBaseModel(GenerationMixin):
         self.layers.append(model_attr)
 
     def load_rotary_pos_emb_to_device(self):
-        state_dict = load_layer(self.checkpoint_path, self.layer_names_dict["rotary_pos_emb"])
+        state_dict = load_layer(
+            self.checkpoint_path,
+            self.layer_names_dict["rotary_pos_emb"],
+            persister=self._persister,
+        )
         self.move_layer_to_device(state_dict)
 
     def load_layer_to_cpu(self, layer_name):
@@ -329,6 +333,7 @@ class RabbitLLMBaseModel(GenerationMixin):
             self.profiling_mode,
             self.prefetching,
             self.profiler if self.profiling_mode else None,
+            persister=self._persister,
         )
 
     def move_layer_to_device(self, state_dict):
@@ -484,8 +489,8 @@ class RabbitLLMBaseModel(GenerationMixin):
         if use_cache:
             for _ in self.layers:
                 kv_cache_list.append(([], []))
-        all_hidden_states = [] * len(self.layers) if output_hidden_states else None
-        all_self_attns = [] * len(self.layers) if output_attentions else None
+        all_hidden_states = [[] for _ in range(len(self.layers))] if output_hidden_states else None
+        all_self_attns = [[] for _ in range(len(self.layers))] if output_attentions else None
 
         with torch.inference_mode(), ThreadPoolExecutor() as executor:
             if self.prefetching:
@@ -660,50 +665,39 @@ class RabbitLLMBaseModel(GenerationMixin):
 
         return batch, kv_cache_list, all_hidden_states, all_self_attns
 
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        **kwargs,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
-
-        if self.profiling_mode:
-            self.profiler.clear_profiling_time()
-            forward_start = time.process_time()
-            forward_start_wall = time.time()
-
+    def _reset_model(self):
+        """Delete the model skeleton and reinitialize it (frees GPU memory before layer loop)."""
         del self.model
         clean_memory()
         self.init_model()
 
-        batch = [
+    def _prepare_batch(self, input_ids):
+        """Move input_ids to running device and shape as list of single-sequence tensors."""
+        return [
             input_ids_unit.to(self.running_device).unsqueeze(0) for input_ids_unit in input_ids
         ]
-        attention_mask, position_ids = build_attention_mask_and_position_ids(
+
+    def _create_masks(self):
+        """Build attention mask and position_ids for the current forward (no past)."""
+        return build_attention_mask_and_position_ids(
             self.running_device,
             self.running_dtype,
             self.max_seq_len,
             self._active_attn_implementation,
         )
 
-        batch, kv_cache_list, all_hidden_states, all_self_attns = self._run_layer_streaming_loop(
-            batch,
-            attention_mask,
-            position_ids,
-            use_cache,
-            output_attentions,
-            output_hidden_states,
-            past_key_values,
-        )
-
+    def _assemble_output(
+        self,
+        batch,
+        kv_cache_list,
+        all_hidden_states,
+        all_self_attns,
+        use_cache,
+        output_attentions,
+        output_hidden_states,
+        return_dict,
+    ):
+        """Build logits tensor and CausalLMOutputWithPast (or tuple) from layer loop outputs."""
         logits = torch.cat(batch, 0)
         if use_cache:
             kv_cache_list = kv_cache_list[1:-2]
@@ -714,8 +708,6 @@ class RabbitLLMBaseModel(GenerationMixin):
                     any_empty = True
                     break
             if any_empty:
-                # Decoder did not fill DynamicCache (e.g. Qwen2 4.47+ with layer-streaming).
-                # Return no cache so generation continues with full re-forward each step (slower).
                 if not self._warned_no_kv_cache:
                     logger.warning(
                         "KV cache was not filled by decoder layers; returning past_key_values=None. "
@@ -749,11 +741,66 @@ class RabbitLLMBaseModel(GenerationMixin):
                 ]
                 if v is not None
             )
+        return CausalLMOutputWithPast(
+            loss=None,
+            logits=logits,
+            past_key_values=tuple(kv_cache_list) if kv_cache_list is not None else None,
+            hidden_states=tuple(all_hidden_states) if all_hidden_states is not None else None,
+            attentions=tuple(all_self_attns) if all_self_attns is not None else None,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        """Run layer-streaming forward: load each layer to device, run, free; return logits and optional cache.
+
+        Rebuilds the model skeleton, runs the layer loop (with optional prefetch), assembles logits.
+        """
+        if self.profiling_mode:
+            self.profiler.clear_profiling_time()
+            forward_start = time.process_time()
+            forward_start_wall = time.time()
+
+        self._reset_model()
+        batch = self._prepare_batch(input_ids)
+        attention_mask, position_ids = self._create_masks()
+
+        batch, kv_cache_list, all_hidden_states, all_self_attns = self._run_layer_streaming_loop(
+            batch,
+            attention_mask,
+            position_ids,
+            use_cache,
+            output_attentions,
+            output_hidden_states,
+            past_key_values,
+        )
+
+        out = self._assemble_output(
+            batch,
+            kv_cache_list,
+            all_hidden_states,
+            all_self_attns,
+            use_cache,
+            output_attentions,
+            output_hidden_states,
+            return_dict,
+        )
+
         if self.profiling_mode:
             forward_elapsed_time = time.process_time() - forward_start
             forward_elapsed_time_wall = time.time() - forward_start_wall
             self.profiler.print_profiling_time()
-
             logger.info(
                 "total infer process time(including all above plus gpu compute): %.04f",
                 forward_elapsed_time,
@@ -762,13 +809,6 @@ class RabbitLLMBaseModel(GenerationMixin):
                 "total infer wall time(including all above plus gpu compute): %.04f",
                 forward_elapsed_time_wall,
             )
-
             self.profiler.clear_profiling_time()
 
-        return CausalLMOutputWithPast(
-            loss=None,
-            logits=logits,
-            past_key_values=tuple(kv_cache_list) if kv_cache_list is not None else None,
-            hidden_states=tuple(all_hidden_states) if all_hidden_states is not None else None,
-            attentions=tuple(all_self_attns) if all_hidden_states is not None else None,
-        )
+        return out

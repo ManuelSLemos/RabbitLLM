@@ -8,6 +8,7 @@ import torch
 from accelerate.utils.modeling import set_module_tensor_to_device
 
 from ..utils import load_layer
+from ..utils.platform import is_cuda_available
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,7 @@ def load_layer_to_cpu(
     profiling_mode: bool,
     prefetching: bool,
     profiler: Optional[Any] = None,
+    persister: Optional[Any] = None,
 ) -> Dict[str, torch.Tensor]:
     """Load a layer's state_dict from checkpoint to CPU, optionally with pin_memory for prefetch.
 
@@ -40,7 +42,9 @@ def load_layer_to_cpu(
         state_dict for the layer.
     """
     t = time.time()
-    load_layer_output = load_layer(checkpoint_path, layer_name, profiling_mode)
+    load_layer_output = load_layer(
+        checkpoint_path, layer_name, profiling_mode, persister=persister
+    )
     elapsed_time = time.time() - t
 
     if profiling_mode:
@@ -54,7 +58,7 @@ def load_layer_to_cpu(
 
     if prefetching:
         t = time.time()
-        if torch.cuda.is_available():
+        if is_cuda_available():
             for k in state_dict.keys():
                 state_dict[k].pin_memory()
         else:

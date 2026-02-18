@@ -1,35 +1,53 @@
-model_persister = None
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+
+_default_persister: Optional["ModelPersister"] = None
 
 
-class ModelPersister:
-    def __init__(self):
+class ModelPersister(ABC):
+    """Abstract base for persisting and loading model layers (safetensors or MLX).
+
+    Use get_model_persister() to obtain the platform-appropriate default instance,
+    or pass a custom persister to RabbitLLMBaseModel.__init__(persister=...).
+    """
+
+    def __init__(self) -> None:
         pass
 
     @classmethod
-    def get_model_persister(cls):
-        global model_persister
-        if model_persister is not None:
-            return model_persister
-
-        from sys import platform
-
-        is_on_mac_os = platform == "darwin"
+    def get_model_persister(cls) -> "ModelPersister":
+        """Return the default ModelPersister for this platform (Safetensor on Linux/Windows, MLX on macOS)."""
+        global _default_persister
+        if _default_persister is not None:
+            return _default_persister
+        from ..utils.platform import is_on_mac_os
 
         if is_on_mac_os:
             from .mlx import MlxModelPersister
 
-            model_persister = MlxModelPersister()
+            _default_persister = MlxModelPersister()  # noqa: PLW0603
         else:
             from .safetensor import SafetensorModelPersister
 
-            model_persister = SafetensorModelPersister()
-        return model_persister
+            _default_persister = SafetensorModelPersister()  # noqa: PLW0603
+        return _default_persister
 
-    def model_persist_exist(self, layer_name, saving_path):
-        pass
+    @abstractmethod
+    def model_persist_exist(self, layer_name: str, saving_path: Path) -> bool:
+        """Return True if the layer is already persisted at saving_path."""
+        ...
 
-    def persist_model(self, state_dict, layer_name, path):
-        pass
+    @abstractmethod
+    def persist_model(
+        self, state_dict: Dict[str, Any], layer_name: str, path: Path
+    ) -> None:
+        """Save a layer state_dict under path with the layer name."""
+        ...
 
-    def load_model(self, layer_name, path):
-        pass
+    @abstractmethod
+    def load_model(self, layer_name: str, path: Union[Path, str]) -> Any:
+        """Load a layer state_dict from path. Returns dict or MLX structure."""
+        ...

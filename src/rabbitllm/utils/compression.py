@@ -44,6 +44,7 @@ def save_quant_state_to_dict(self, packed=True):
 
 
 def uncompress_layer_state_dict(layer_state_dict):
+    """Dequantize 4bit/8bit layer state_dict to float16; pass-through if not compressed."""
     if not bitsandbytes_installed:
         raise ImportError(
             "bitsandbytes is required for uncompressing 4bit/8bit layers. "
@@ -88,6 +89,7 @@ def uncompress_layer_state_dict(layer_state_dict):
 
 
 def compress_layer_state_dict(layer_state_dict, compression=None):
+    """Quantize layer state_dict to 4bit or 8bit (bitsandbytes); pass-through if compression None."""
     if compression and not bitsandbytes_installed:
         raise ImportError(
             "bitsandbytes is required for compression. Install with: pip install bitsandbytes"

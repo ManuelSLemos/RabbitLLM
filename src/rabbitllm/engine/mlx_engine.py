@@ -1,7 +1,8 @@
 import argparse
-import json
-import time
 import gc
+import json
+import logging
+import time
 from tqdm import tqdm
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,8 @@ from transformers import (
     GenerationConfig,
 )
 from ..utils import clean_memory, load_layer, find_or_create_local_splitted_path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -213,8 +216,13 @@ class RabbitLLMLlamaMlx:
         consumed = self.initial_available - available
         max_consumed = self.initial_available - self.least_available
 
-        print(
-            f"[{msg}] - available mem: {available:.02f}mb, consumed: {consumed:.02f}mb, least available:{available:.02f}mb, max consumed: {max_consumed:.02f}mb"
+        logger.debug(
+            "[%s] - available mem: %.02fmb, consumed: %.02fmb, least available: %.02fmb, max consumed: %.02fmb",
+            msg,
+            available,
+            consumed,
+            available,
+            max_consumed,
         )
 
     def __init__(
@@ -321,7 +329,7 @@ class RabbitLLMLlamaMlx:
             del self.tok_embeddings
             gc.collect()
         else:
-            print(f"self.test_nonlayered:{self.test_nonlayered}, save layers")
+            logger.debug("self.test_nonlayered: %s, save layers", self.test_nonlayered)
             self.layers = []
 
         self.record_memory("after_tok_embeddings")

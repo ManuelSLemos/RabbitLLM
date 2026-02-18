@@ -1,8 +1,12 @@
+from __future__ import annotations
+
 import json
+import logging
 import os
 import time
 from glob import glob
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -11,6 +15,8 @@ from tqdm import tqdm
 import huggingface_hub
 
 from .memory import NotEnoughSpaceException, clean_memory
+
+logger = logging.getLogger(__name__)
 from .compression import (
     bitsandbytes_installed,
     compress_layer_state_dict,
@@ -19,7 +25,7 @@ from .compression import (
 from ..persist import ModelPersister
 
 
-def remove_real_and_linked_file(to_delete):
+def remove_real_and_linked_file(to_delete: Union[Path, str]) -> None:
     targetpath = None
     if os.path.realpath(to_delete) != to_delete:
         targetpath = os.path.realpath(to_delete)
@@ -30,11 +36,12 @@ def remove_real_and_linked_file(to_delete):
 
 
 def check_space(
-    checkpoint_path,
-    layer_shards_saving_path=None,
-    compression=None,
-    splitted_model_dir_name="splitted_model",
-):
+    checkpoint_path: Union[Path, str],
+    layer_shards_saving_path: Optional[Union[Path, str]] = None,
+    compression: Optional[str] = None,
+    splitted_model_dir_name: str = "splitted_model",
+) -> None:
+    checkpoint_path = Path(checkpoint_path)
     total_shard_files_size_bytes = 0
     for model_shard_file in glob(str(checkpoint_path / "*")):
         total_shard_files_size_bytes += os.path.getsize(model_shard_file)
@@ -65,8 +72,25 @@ def check_space(
         )
 
 
-def load_layer(local_path, layer_name, profiling=False):
-    layer_state_dict = ModelPersister.get_model_persister().load_model(layer_name, local_path)
+def load_layer(
+    local_path: Union[Path, str],
+    layer_name: str,
+    profiling: bool = False,
+    persister: Optional[Any] = None,
+) -> Union[Dict[str, Any], Tuple[Dict[str, Any], float]]:
+    """Load a single layer state_dict from the split checkpoint, optionally with timing.
+
+    Args:
+        local_path: Path to the split checkpoint directory.
+        layer_name: Layer key (e.g. "model.layers.0").
+        profiling: If True, return (state_dict, elapsed_time) else state_dict.
+        persister: Optional ModelPersister; if None, uses get_model_persister().
+
+    Returns:
+        state_dict, or (state_dict, float) when profiling=True.
+    """
+    p = persister if persister is not None else ModelPersister.get_model_persister()
+    layer_state_dict = p.load_model(layer_name, local_path)
 
     if profiling:
         t = time.process_time()
@@ -81,17 +105,29 @@ def load_layer(local_path, layer_name, profiling=False):
 
 
 def split_and_save_layers(
-    checkpoint_path,
-    layer_shards_saving_path=None,
-    splitted_model_dir_name="splitted_model",
-    compression=None,
-    layer_names=None,
-    delete_original=False,
-    repo_id=None,
-    hf_token=None,
-):
-    """
-    Save the all layers of a model sharded checkpoint using safetensors.
+    checkpoint_path: Union[Path, str],
+    layer_shards_saving_path: Optional[Union[Path, str]] = None,
+    splitted_model_dir_name: str = "splitted_model",
+    compression: Optional[str] = None,
+    layer_names: Optional[Dict[str, str]] = None,
+    delete_original: bool = False,
+    repo_id: Optional[str] = None,
+    hf_token: Optional[str] = None,
+) -> str:
+    """Split a sharded checkpoint into per-layer safetensors and save to disk.
+
+    Args:
+        checkpoint_path: Path to the checkpoint dir (must contain index JSON).
+        layer_shards_saving_path: Optional base path for split output.
+        splitted_model_dir_name: Subdir name (suffix .4bit/.8bit added if compression set).
+        compression: "4bit" or "8bit" for quantized layers (requires bitsandbytes).
+        layer_names: Dict with embed, layer_prefix, norm, lm_head keys; inferred if None.
+        delete_original: If True, remove original shard files after saving each layer.
+        repo_id: HuggingFace repo ID for re-downloading missing shards.
+        hf_token: HuggingFace token for gated repos.
+
+    Returns:
+        Path to the directory containing the split layer files (as string).
     """
 
     if compression is not None:
@@ -167,13 +203,13 @@ def split_and_save_layers(
                 layer, saving_path
             )
 
-        print(f"found_layers:{found_layers}")
+        logger.debug("found_layers: %s", found_layers)
         if all(found_layers.values()):
-            print(f"saved layers already found in {saving_path}")
+            logger.info("saved layers already found in %s", saving_path)
             return str(saving_path)
         else:
-            print(
-                f"some layer splits found, some are not, re-save all layers in case there's some corruptions."
+            logger.warning(
+                "some layer splits found, some are not, re-save all layers in case there's some corruptions."
             )
 
     if not delete_original:
@@ -195,7 +231,7 @@ def split_and_save_layers(
 
     if single_file_model:
         single_modelfile = "model.safetensors"
-        print(f"Loading single-file model: {single_modelfile}")
+        logger.info("Loading single-file model: %s", single_modelfile)
         state_dict = load_file(single_file_path, device="cpu")
 
     for layer in tqdm(layers):
@@ -219,10 +255,10 @@ def split_and_save_layers(
                                 / f"model-000{shard:02d}-of-000{n_shards:02d}.safetensors"
                             )
 
-                        print(f"deleting original file: {to_delete}")
+                        logger.debug("deleting original file: %s", to_delete)
                         remove_real_and_linked_file(to_delete)
                     shard += 1
-                    print(f"Loading shard {shard}/{n_shards}")
+                    logger.info("Loading shard %s/%s", shard, n_shards)
 
                     if not safetensors_format:
                         to_load = (
@@ -276,22 +312,35 @@ def split_and_save_layers(
 
     if delete_original and single_modelfile is not None:
         to_delete = checkpoint_path / single_modelfile
-        print(f"deleting original file: {to_delete}")
+        logger.debug("deleting original file: %s", to_delete)
         remove_real_and_linked_file(to_delete)
 
     return str(saving_path)
 
 
 def find_or_create_local_splitted_path(
-    model_local_path_or_repo_id,
-    layer_shards_saving_path=None,
-    compression=None,
-    layer_names=None,
-    hf_token=None,
-    delete_original=False,
-):
-    """
-    find the model's local cache path, download the cache if not exists, then split and save the model.
+    model_local_path_or_repo_id: str,
+    layer_shards_saving_path: Optional[Union[Path, str]] = None,
+    compression: Optional[str] = None,
+    layer_names: Optional[Dict[str, str]] = None,
+    hf_token: Optional[str] = None,
+    delete_original: bool = False,
+) -> Tuple[Path, str]:
+    """Resolve local checkpoint path and ensure the model is split into per-layer files.
+
+    If the path is local and has an index, splits in place. Otherwise downloads from
+    HuggingFace (model_local_path_or_repo_id as repo ID) then splits.
+
+    Args:
+        model_local_path_or_repo_id: Local path or HuggingFace repo ID.
+        layer_shards_saving_path: Optional base path for split output.
+        compression: "4bit" or "8bit" for quantized layers.
+        layer_names: Dict for layer naming; inferred if None.
+        hf_token: HuggingFace token for gated repos.
+        delete_original: If True, delete original shards after splitting.
+
+    Returns:
+        Tuple of (model_local_path, split_dir_path) where split_dir_path is the split output.
     """
 
     if os.path.exists(model_local_path_or_repo_id):
@@ -300,7 +349,7 @@ def find_or_create_local_splitted_path(
         ) or os.path.exists(Path(model_local_path_or_repo_id) / "model.safetensors.index.json")
         has_single_file = os.path.exists(Path(model_local_path_or_repo_id) / "model.safetensors")
         if has_index or has_single_file:
-            print(f"found model checkpoint...")
+            logger.info("found model checkpoint...")
             return Path(model_local_path_or_repo_id), split_and_save_layers(
                 model_local_path_or_repo_id,
                 layer_shards_saving_path,
@@ -309,8 +358,9 @@ def find_or_create_local_splitted_path(
                 delete_original=delete_original,
             )
         else:
-            print(
-                f"Found local directory in {model_local_path_or_repo_id}, but didn't find downloaded model. Try using {model_local_path_or_repo_id} as a HF repo..."
+            logger.warning(
+                "Found local directory in %s, but didn't find downloaded model. Try using it as a HF repo...",
+                model_local_path_or_repo_id,
             )
 
     hf_cache_path = huggingface_hub.snapshot_download(

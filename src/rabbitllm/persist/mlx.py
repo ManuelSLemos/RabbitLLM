@@ -1,13 +1,17 @@
+import logging
 import os
-from pathlib import Path
-import mlx.core as mx
-from .base import ModelPersister
-from mlx.utils import tree_unflatten
-import torch
-
-import psutil
-import numpy as np
 from itertools import starmap
+from pathlib import Path
+
+import numpy as np
+import psutil
+import torch
+import mlx.core as mx
+from mlx.utils import tree_unflatten
+
+from .base import ModelPersister
+
+logger = logging.getLogger(__name__)
 
 
 def map_torch_to_mlx(model):
@@ -60,7 +64,7 @@ class MlxModelPersister(ModelPersister):
         weights = {k: v.to(torch.float16).numpy() for k, v in state_dict.items()}
         np.savez(saving_path / (layer_name + "mlx"), **weights)
 
-        print(f"saved as: {saving_path / (layer_name + 'mlx')}")
+        logger.debug("saved as: %s", saving_path / (layer_name + "mlx"))
 
         (saving_path / (layer_name + "mlx.done")).touch()
 
@@ -75,5 +79,5 @@ class MlxModelPersister(ModelPersister):
 
             return weights
         except Exception as ex:
-            print(f"error: {layer_name}, {path}")
+            logger.error("error loading layer %s from %s: %s", layer_name, path, ex)
             raise ex

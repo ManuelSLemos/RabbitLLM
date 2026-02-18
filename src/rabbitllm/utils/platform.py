@@ -8,6 +8,16 @@ if platform == "darwin":
     is_on_mac_os = True
 
 
+def is_macos() -> bool:
+    """Return True if running on macOS (Darwin)."""
+    return is_on_mac_os
+
+
+def is_cuda_available() -> bool:
+    """Return True if CUDA is available for PyTorch."""
+    return torch.cuda.is_available()
+
+
 def is_flash_attention_available():
     """Check if flash-attn is installed and GPU supports it (Ampere+, SM >= 80).
 

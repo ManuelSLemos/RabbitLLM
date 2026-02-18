@@ -1,4 +1,8 @@
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class LayeredProfiler:
@@ -16,8 +20,11 @@ class LayeredProfiler:
         if self.print_memory:
             free_mem = torch.cuda.mem_get_info()[0]
             self.min_free_mem = min(self.min_free_mem, free_mem)
-            print(
-                f"free vmem @{item}: {free_mem / 1024 / 1024 / 1024:.02f}GB, min free: {self.min_free_mem / 1024 / 1024 / 1024:.02f}GB"
+            logger.debug(
+                "free vmem @%s: %.02fGB, min free: %.02fGB",
+                item,
+                free_mem / 1024 / 1024 / 1024,
+                self.min_free_mem / 1024 / 1024 / 1024,
             )
 
     def clear_profiling_time(self):
@@ -26,4 +33,6 @@ class LayeredProfiler:
 
     def print_profiling_time(self):
         for item in self.profiling_time_dict.keys():
-            print(f"total time for {item}: {sum(self.profiling_time_dict[item])}")
+            logger.info(
+                "total time for %s: %s", item, sum(self.profiling_time_dict[item])
+            )
