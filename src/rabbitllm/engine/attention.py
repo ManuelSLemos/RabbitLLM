@@ -76,19 +76,22 @@ def create_model_from_config(config, attn_implementation, **extra_kwargs):
         Model on meta device.
     """
     devnull = io.StringIO()
-    with init_empty_weights(), \
-         contextlib.redirect_stdout(devnull), \
-         contextlib.redirect_stderr(devnull), \
-         warnings.catch_warnings():
+    with (
+        init_empty_weights(),
+        contextlib.redirect_stdout(devnull),
+        contextlib.redirect_stderr(devnull),
+        warnings.catch_warnings(),
+    ):
         warnings.simplefilter("ignore")
         root_logger = logging.getLogger()
         prev_level = root_logger.level
         root_logger.setLevel(logging.ERROR)
         try:
             return AutoModelForCausalLM.from_config(
-                config, trust_remote_code=True,
+                config,
+                trust_remote_code=True,
                 attn_implementation=attn_implementation,
-                **extra_kwargs
+                **extra_kwargs,
             )
         finally:
             root_logger.setLevel(prev_level)

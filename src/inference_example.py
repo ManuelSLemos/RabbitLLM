@@ -34,22 +34,25 @@ input_tokens = model.tokenizer(
     return_tensors="pt",
     return_attention_mask=False,
     truncation=True,
-    max_length=MAX_LENGTH)
+    max_length=MAX_LENGTH,
+)
 
 t1 = time.perf_counter()
 generation_output = model.generate(
-    input_tokens['input_ids'].to(device),
+    input_tokens["input_ids"].to(device),
     max_new_tokens=50,
     use_cache=True,
     do_sample=False,
-    return_dict_in_generate=True)
+    return_dict_in_generate=True,
+)
 gen_s = time.perf_counter() - t1
 
-input_len = input_tokens['input_ids'].shape[1]
+input_len = input_tokens["input_ids"].shape[1]
 num_tokens = generation_output.sequences.shape[1] - input_len
 # Decode only the newly generated tokens, not the full conversation
 output = model.tokenizer.decode(
-    generation_output.sequences[0][input_len:], skip_special_tokens=True)
+    generation_output.sequences[0][input_len:], skip_special_tokens=True
+)
 
 print(output.strip())
-print(f"[time] generate: {gen_s:.2f}s | new tokens: {num_tokens} | {num_tokens/gen_s:.1f} tok/s")
+print(f"[time] generate: {gen_s:.2f}s | new tokens: {num_tokens} | {num_tokens / gen_s:.1f} tok/s")

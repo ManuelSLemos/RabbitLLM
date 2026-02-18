@@ -1,5 +1,3 @@
-
-
 import os
 from pathlib import Path
 import mlx.core as mx
@@ -10,7 +8,6 @@ import torch
 import psutil
 import numpy as np
 from itertools import starmap
-
 
 
 def map_torch_to_mlx(model):
@@ -28,12 +25,8 @@ def map_torch_to_mlx(model):
     model = {k.replace("gate_proj", "w1"): v for k, v in model.items()}
 
     # 4. layernorms
-    model = {
-        k.replace("input_layernorm", "attention_norm"): v for k, v in model.items()
-    }
-    model = {
-        k.replace("post_attention_layernorm", "ffn_norm"): v for k, v in model.items()
-    }
+    model = {k.replace("input_layernorm", "attention_norm"): v for k, v in model.items()}
+    model = {k.replace("post_attention_layernorm", "ffn_norm"): v for k, v in model.items()}
 
     # 5. lm head
     model = {k.replace("lm_head", "output"): v for k, v in model.items()}
@@ -48,38 +41,28 @@ def map_torch_to_mlx(model):
     model = {k.replace("v_proj", "wv"): v for k, v in model.items()}
     model = {k.replace("o_proj", "wo"): v for k, v in model.items()}
 
-
     return model
 
+
 class MlxModelPersister(ModelPersister):
-
-
     def __init__(self, *args, **kwargs):
-
 
         super(MlxModelPersister, self).__init__(*args, **kwargs)
 
-
     def model_persist_exist(self, layer_name, saving_path):
 
-
-
-        safetensor_exists = os.path.exists(str(saving_path / (layer_name + 'mlx.npz')))
-        done_marker_exists = os.path.exists(str(saving_path / (layer_name + 'mlx.done')))
+        safetensor_exists = os.path.exists(str(saving_path / (layer_name + "mlx.npz")))
+        done_marker_exists = os.path.exists(str(saving_path / (layer_name + "mlx.done")))
 
         return safetensor_exists and done_marker_exists
 
     def persist_model(self, state_dict, layer_name, saving_path):
         weights = {k: v.to(torch.float16).numpy() for k, v in state_dict.items()}
-        np.savez(
-            saving_path / (layer_name + 'mlx'),
-            **weights
-        )
+        np.savez(saving_path / (layer_name + "mlx"), **weights)
 
         print(f"saved as: {saving_path / (layer_name + 'mlx')}")
 
-        (saving_path / (layer_name + 'mlx.done')).touch()
-
+        (saving_path / (layer_name + "mlx.done")).touch()
 
     def load_model(self, layer_name, path):
         try:

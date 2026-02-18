@@ -20,6 +20,7 @@ def is_flash_attention_available():
     """
     try:
         import flash_attn  # noqa: F401
+
         flash_installed = True
     except ImportError:
         flash_installed = False

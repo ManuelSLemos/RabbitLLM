@@ -58,9 +58,7 @@ def load_layer_to_cpu(
             for k in state_dict.keys():
                 state_dict[k].pin_memory()
         else:
-            logger.debug(
-                "Prefetching is enabled, but no pin_memory operation is needed for CPU."
-            )
+            logger.debug("Prefetching is enabled, but no pin_memory operation is needed for CPU.")
         elapsed_time = time.time() - t
         if profiling_mode and profiler is not None:
             profiler.add_profiling_time("pin_memory_to_trigger_load", elapsed_time)
@@ -103,9 +101,7 @@ def move_layer_to_device(
             layers.append(param_name)
         else:
             if ".weight" in param_name:
-                layer_name = param_name[
-                    : param_name.index(".weight") + len(".weight")
-                ]
+                layer_name = param_name[: param_name.index(".weight") + len(".weight")]
                 if layer_name not in layers:
                     layers.append(layer_name)
 

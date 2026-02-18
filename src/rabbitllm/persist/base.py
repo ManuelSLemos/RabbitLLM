@@ -1,5 +1,3 @@
-
-
 model_persister = None
 
 
@@ -14,13 +12,16 @@ class ModelPersister:
             return model_persister
 
         from sys import platform
+
         is_on_mac_os = platform == "darwin"
 
         if is_on_mac_os:
             from .mlx import MlxModelPersister
+
             model_persister = MlxModelPersister()
         else:
             from .safetensor import SafetensorModelPersister
+
             model_persister = SafetensorModelPersister()
         return model_persister
 

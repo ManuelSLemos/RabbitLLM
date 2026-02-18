@@ -27,7 +27,5 @@ while True:
         return_dict_in_generate=True,
     )
 
-    output = model.tokenizer.decode(
-        generation_output.sequences[0], skip_special_tokens=True
-    )
+    output = model.tokenizer.decode(generation_output.sequences[0], skip_special_tokens=True)
     print(f"\n{output}\n")

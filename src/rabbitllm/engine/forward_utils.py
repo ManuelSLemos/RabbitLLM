@@ -41,9 +41,7 @@ def build_attention_mask_and_position_ids(
         (1, max_seq_len) on device.
     """
     if attn_implementation == "flash_attention_2":
-        attention_mask = torch.ones(
-            1, max_seq_len, dtype=torch.long, device=device
-        )
+        attention_mask = torch.ones(1, max_seq_len, dtype=torch.long, device=device)
     elif attn_implementation == "sdpa":
         attention_mask = None
     else:
@@ -55,9 +53,7 @@ def build_attention_mask_and_position_ids(
         )
         attention_mask = torch.triu(attention_mask, diagonal=1)[None, None, ...]
 
-    position_ids = torch.arange(
-        max_seq_len, dtype=torch.long, device=device
-    )[None, :]
+    position_ids = torch.arange(max_seq_len, dtype=torch.long, device=device)[None, :]
     return attention_mask, position_ids
 
 
