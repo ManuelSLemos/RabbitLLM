@@ -48,9 +48,25 @@ Common issues and how they were addressed in the codebase.
 
 **Symptom**: A warning appears once during generation: *"KV cache was not filled by decoder layers; returning past_key_values=None. Generation will work but each step re-runs the full forward (no incremental decoding)."*
 
-**Cause**: This is a **known limitation** with **Qwen2 / Qwen2.5** and **transformers 4.47+** in layer-streaming mode. The decoder layers may not fill the `DynamicCache` we pass; the engine then returns `past_key_values=None` and logs the warning. Generation is correct but each new token re-runs the full forward (no KV cache reuse), so throughput is lower.
+**Cause**: In **transformers 4.47+**, decoder layers (e.g. Qwen2/Qwen2.5) often **do not return** the cache in the layer output tuple; they update the `DynamicCache` **in-place**. The engine passes an empty cache, calls the layer, and if the output has no KV it uses a **fallback**: read from the same cache object (new API: `.layers[0].keys` / `.layers[0].values`; legacy: `.key_cache[-1]` / `.value_cache[-1]`) to fill `past_key_values`. You must use `return_dict=True` so the forward output includes `past_key_values`. If the cache is still not filled, each step re-runs the full forward and throughput drops.
 
-**What to do**: No fix is required. The warning is informational. See [COMPATIBILITY.md](COMPATIBILITY.md) (Qwen2 / Qwen2.5 with transformers 4.47+) for details. A future code change may restore KV cache for these models in streaming mode.
+**What to do**: Ensure `return_dict=True` when using `use_cache=True`. If the warning persists, the Cache API or layer kwargs may have changed. See [COMPATIBILITY.md](COMPATIBILITY.md) (Qwen2, KV cache).
+
+**Nota para versiones superiores (5.1+)**: Al subir transformers, **revalidar** el flujo de KV cache en layer-streaming: que el fallback siga leyendo correctamente del `DynamicCache` (atributos `.layers` vs `.key_cache`/`.value_cache`), que `cache_position` y `position_embeddings` se pasen con las formas esperadas en el primer e incremental forward, y que el mismo objeto cache que se pasa a la capa sea el que se inspecciona después. Solución pendiente si la API de Cache cambia en 5.1+.
+
+## Error 14 vs 64 en `apply_rotary_pos_emb` (transformers 5.1+)
+
+**Síntoma**: Al usar **versiones superiores de transformers** (5.1.x, 5.2.x o posteriores) con Qwen2/Qwen2.5 y **KV cache** (forward incremental), falla con:
+
+```text
+RuntimeError: The size of tensor a (14) must match the size of tensor b (64) at non-singleton dimension 3
+```
+
+(en `transformers/models/qwen2/modeling_qwen2.py`, en `apply_rotary_pos_emb`: `q_embed = (q * cos) + ...`).
+
+**Causa**: En esas versiones, la atención puede crearse con un `head_dim` incorrecto (p. ej. 14 en lugar de `hidden_size // num_attention_heads` = 64). Los cos/sin de RoPE se calculan con 64 y el tensor `q` sale con última dimensión 14, de ahí el mismatch.
+
+**Qué hacer**: Quedarse en **transformers 5.0.x** para Qwen2/Qwen2.5 hasta tener una solución. Ver [COMPATIBILITY.md](COMPATIBILITY.md) (versiones superiores). **Solución pendiente** para 5.1+.
 
 ## CUDA error: device-side assert (inf/nan in logits or sampling)
 

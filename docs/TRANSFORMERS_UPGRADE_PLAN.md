@@ -167,6 +167,16 @@ Este documento describe un plan por fases para subir la versión de `transformer
 
 - Cambios de interfaz de atención (5.2) pueden afectar a código que construye máscaras a mano; revisar `forward_utils` y `attention.py`.
 
+### Problemas conocidos al subir a 5.1+
+
+1. **Qwen2/Qwen2.5: 14 vs 64 en RoPE**  
+   Con layer-streaming y KV cache (segundo forward con `past_key_values`) aparece  
+   `RuntimeError: The size of tensor a (14) must match the size of tensor b (64) at non-singleton dimension 3` en `apply_rotary_pos_emb`.  
+   **Causa**: `head_dim` incorrecto en la atención. **Buscar solución** al planificar 5.1/5.2. Ver [COMPATIBILITY.md](COMPATIBILITY.md) y [TROUBLESHOOTING.md](TROUBLESHOOTING.md#error-14-vs-64-en-apply_rotary_pos_emb-transformers-51).
+
+2. **KV cache en layer-streaming**  
+   En 4.47+ las capas decoder (Qwen2, etc.) no devuelven el cache en la tupla; actualizan el `DynamicCache` in-place. El motor usa un fallback leyendo del objeto cache (`.layers[0].keys`/`.values` o legacy `.key_cache`/`.value_cache`). Al subir a **5.1+**, comprobar que la API de Cache no haya cambiado y que el KV cache siga rellenándose; si reaparece el aviso *"KV cache was not filled"*, revalidar fallback, `cache_position`, `position_embeddings` y que se use el mismo objeto cache en paso e incremental. Ver [TROUBLESHOOTING.md](TROUBLESHOOTING.md#kv-cache-not-filled--no-incremental-decoding).
+
 ---
 
 ## Orden recomendado de trabajo

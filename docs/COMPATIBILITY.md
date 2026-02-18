@@ -3,7 +3,9 @@
 ## Transformers version
 
 - **Supported**: `transformers>=5.0,<5.1` (5.0.x only).
-- **5.1.x / 5.2.x**: Not supported for Qwen2/Qwen2.5 layer-streaming due to a RoPE/head_dim mismatch in the attention layer (`apply_rotary_pos_emb` 14 vs 64). A fix is pending; use 5.0.x for Qwen2/Qwen2.5 until then.
+- **Versiones superiores (5.1.x / 5.2.x y posteriores)**:
+  - **RoPE 14 vs 64**: Con Qwen2/Qwen2.5 en layer-streaming aparece un error en el forward incremental (segundo forward con `past_key_values`): `RuntimeError: The size of tensor a (14) must match the size of tensor b (64) at non-singleton dimension 3` en `apply_rotary_pos_emb` (q * cos). Causa: `head_dim` incorrecto en la atención. **Solución pendiente**; usar 5.0.x para Qwen2/Qwen2.5 hasta resolverlo.
+  - **KV cache**: En 4.47+ las capas decoder de Qwen2 (y similares) no devuelven el cache en la tupla; lo actualizan in-place en el `DynamicCache`. El motor usa un fallback leyendo del objeto cache (`.layers[0].keys`/`.values` o legacy `.key_cache`/`.value_cache`) y debe pasar `cache_position` 1D y el mismo objeto que luego se lee. Al subir a 5.1+, **revisar** que la API de Cache (DynamicCache, `.layers`, etc.) no haya cambiado y que el KV cache en layer-streaming siga rellenándose; si vuelve el aviso "KV cache was not filled", revalidar fallback y kwargs del primer/incremental forward. Ver [TROUBLESHOOTING.md](TROUBLESHOOTING.md#kv-cache-not-filled--no-incremental-decoding).
 
 The codebase uses `GenerationMixin` from `transformers.generation.utils` (with fallback from `transformers`) and `Cache`/`DynamicCache` from `transformers.cache_utils`.
 
@@ -51,7 +53,7 @@ This project targets `transformers>=5.0`. Ensure: Python 3.10+, PyTorch 2.0+ (2.
 
 - Decoder layers expect **`position_embeddings`** (cos, sin tuple) from RoPE; `RabbitLLMQWen2` overrides `get_pos_emb_args()` to compute and pass them.
 - **RoPE head_dim**: Some configs set `head_dim` to `num_attention_heads` (e.g. 14) instead of `hidden_size // num_attention_heads` (e.g. 64), causing a shape mismatch in `apply_rotary_pos_emb`. The engine applies several fixes: (1) set `config.head_dim` to the canonical value in `__init__` and at the start of `init_model()`; (2) `_fix_attention_head_dim()` forces the same value on all decoder `self_attn` modules after creating the model and at the start of the layer loop; (3) Qwen2’s `get_pos_emb_args()` uses the canonical head_dim and treats `head_dim == num_attention_heads` as wrong and uses the canonical value for cos/sin. With **transformers 5.1+** a runtime mismatch (14 vs 64) occurs in layer-streaming; use **transformers 5.0.x** for Qwen2/Qwen2.5 until a fix is available.
-- When using layer-streaming, the decoder may not fill the `DynamicCache` we pass; the engine then returns `past_key_values=None` and logs a warning once. Generation still works but each step re-runs the full forward (no incremental decoding), so throughput is lower. This is a known limitation with Qwen2 in 4.47+ under streaming; using a non-streaming run or a future fix will restore KV cache.
+- **KV cache en layer-streaming**: En 4.47+ las capas decoder no devuelven el cache en la tupla; actualizan el `DynamicCache` in-place. El motor pasa un cache vacío, llama a la capa y, si la salida no trae KV, lee del mismo objeto (nueva API `.layers[0].keys`/`.values` o legacy `.key_cache`/`.value_cache`) para rellenar `past_key_values`. Hay que usar `return_dict=True` para que la salida tenga `past_key_values`. Si el cache no se rellena, cada paso re-ejecuta el forward completo (throughput bajo). En **versiones superiores de transformers** (5.1+), comprobar que la API de Cache y este fallback sigan siendo válidos; anotado para resolver al subir de versión.
 
 ### Fixes that apply to all models (base engine)
 
