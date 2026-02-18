@@ -4,93 +4,66 @@
 
 RabbitLLM is a discontinued project with a powerful core idea: **layer-streaming inference** that allows 70B+ LLMs to run on 4GB GPUs without quantization. The codebase works but suffers from legacy packaging, zero CI/CD, no type hints, print-based "logging", minimal tests (73 LOC), and missing features that modern tools like Ollama/vLLM offer (CLI, API server, streaming, chat templates). The goal is a full refactor + rebrand into a modern, production-grade project with both CLI and server capabilities.
 
-**Name**: TBD (using `newproject` as placeholder — will be replaced once decided).
+**Name**: RabbitLLM (package `rabbitllm`; CLI `rabbit` from Phase 3 onward).
 
 ---
 
 ## Phase 1: Restructure + Modernize Packaging
 
-### 1.1 Flatten directory structure
+**Review (current repo):** The project already uses `src/rabbitllm/` with `engine/`, `models/`, `persist/`, `utils/`, `compat/`, and `profiler.py`. No `rabbit_llm/` exists. `pyproject.toml` (hatchling, deps, ruff, pytest) and `.gitignore` are in place. Imports use `rabbitllm` paths. Below: what is **done** vs **pending**.
 
-Current awkward nesting `rabbit_llm/rabbitllm/` → clean `src/` layout:
+### 1.1 Directory structure — DONE
 
-```
-src/newproject/
-  __init__.py              # Clean public API exports
-  _version.py              # "3.0.0a1"
-  engine/
-    __init__.py
-    base.py                ← rabbit_llm/rabbitllm/rabbitllm_base.py
-    mlx_engine.py          ← rabbit_llm/rabbitllm/rabbitllm_llama_mlx.py
-  models/
-    __init__.py
-    registry.py            ← rabbit_llm/rabbitllm/auto_model.py
-    llama.py               ← rabbit_llm/rabbitllm/rabbitllm.py
-    qwen.py                ← rabbit_llm/rabbitllm/rabbitllm_qwen.py
-    qwen2.py               ← rabbit_llm/rabbitllm/rabbitllm_qwen2.py
-    chatglm.py             ← rabbit_llm/rabbitllm/rabbitllm_chatglm.py
-    baichuan.py            ← rabbit_llm/rabbitllm/rabbitllm_baichuan.py
-    internlm.py            ← rabbit_llm/rabbitllm/rabbitllm_internlm.py
-    mistral.py             ← rabbit_llm/rabbitllm/rabbitllm_mistral.py
-    mixtral.py             ← rabbit_llm/rabbitllm/rabbitllm_mixtral.py
-  persist/
-    __init__.py
-    base.py                ← rabbit_llm/rabbitllm/persist/model_persister.py
-    safetensor.py          ← rabbit_llm/rabbitllm/persist/safetensor_model_persister.py
-    mlx.py                 ← rabbit_llm/rabbitllm/persist/mlx_model_persister.py
-  utils/
-    __init__.py
-    memory.py              ← clean_memory() etc. from utils.py
-    compression.py         ← compress/uncompress from utils.py
-    splitting.py           ← split_and_save_layers() etc. from utils.py
-    platform.py            ← NEW: single source of truth for platform detection
-  compat/
-    __init__.py
-    tokenization_baichuan.py ← rabbit_llm/rabbitllm/tokenization_baichuan.py
-  profiler.py              ← rabbit_llm/rabbitllm/profiler.py
-tests/
-  conftest.py
-  test_model_registry.py
-  test_compression.py
-```
+`src/rabbitllm/` layout and `tests/` already match the target. No migration needed.
 
-### 1.2 Delete legacy directories
+### 1.2 Legacy directories — MOSTLY DONE
 
-Remove entirely: `training/`, `rlhf/`, `anima_100k/`, `eval/`, `scripts/`, `data/`, `rabbit_llm/` (after moving core files), `requirements.txt`, `README_ja.md`
+`training/`, `rlhf/`, `anima_100k/`, `eval/`, `data/`, `rabbit_llm/`, `requirements.txt`, `README_ja.md` are not present.
 
-### 1.3 Create `pyproject.toml` (replace `setup.py`)
+- **Pending:** Remove empty `scripts/` if no longer needed (or keep for future helper scripts).
 
-- Build system: `hatchling`
-- Python: `>=3.10`
-- Dependencies with proper version ranges (no more git deps):
-  - `torch>=2.0`, `transformers>=4.36`, `accelerate>=0.25`, `safetensors>=0.4`, `huggingface-hub>=0.20`, `tqdm`, `scipy`
-- Optional extras: `[mlx]`, `[compression]`, `[server]`, `[cli]`, `[dev]`
-- Entry point: `newproject = "newproject.cli:app"`
-- Tool config: ruff (lint+format), pytest, mypy
-- **Remove the `PostInstallCommand` hack** — `transformers>=4.36` eliminates the rope_scaling issue
+### 1.3 `pyproject.toml` — DONE (entry point in Phase 3)
 
-### 1.4 Create `Makefile`
+- Build system, Python ≥3.10, dependencies and optional extras (`compression`, `flash`, `server`, `dev`) are set. Transformers is `>=4.47,<4.49`.
+- **Do not add** CLI entry point until Phase 3 (no `rabbitllm.cli` yet). Optionally add `[mlx]` extra when relevant.
 
-Commands: `install`, `dev`, `lint`, `format`, `test`, `test-cov`, `typecheck`, `clean`
+### 1.4 Makefile — PENDING
 
-### 1.5 Set up GitHub Actions CI
+Current Makefile only has `bash` (Docker). Add:
 
-`.github/workflows/ci.yml`: lint (ruff) + test (pytest, Python 3.10/3.11/3.12, skip CUDA tests)
+- `install` — `uv sync --extra dev`
+- `dev` — same as install
+- `lint` — `ruff check src/ tests/`
+- `format` — `ruff format src/ tests/`
+- `test` — `pytest tests/`
+- `test-cov` — `pytest tests/ --cov=rabbitllm`
+- `typecheck` — `mypy src/rabbitllm/ --ignore-missing-imports`
+- `clean` — remove `build/`, `dist/`, `*.egg-info`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `htmlcov/`, `.coverage`
 
-### 1.6 Update `.gitignore`
+Keep `bash` if you use it for Docker.
 
-Comprehensive Python gitignore (venv, coverage, caches, etc.)
+### 1.5 GitHub Actions CI — PENDING
 
-### 1.7 Update all imports
+Create `.github/workflows/ci.yml`:
 
-Rewrite every import across the codebase to use the new package paths.
+- Trigger on push/PR to main (or master).
+- Matrix: Python 3.10, 3.11, 3.12.
+- Steps: checkout, set up Python, install with `.[dev]`, `ruff check src/ tests/`, `ruff format --check src/ tests/`, `pytest tests/` (skip or mark CUDA-only tests so CI passes without GPU).
 
-### Verification
+### 1.6 `.gitignore` — DONE (optional tweaks)
 
-- `pip install -e ".[dev]"` installs cleanly
-- `ruff check src/ tests/` passes
-- `pytest tests/` — existing tests pass with updated imports
-- `python -c "from newproject import AutoModel"` works
+Current file is adequate. Optionally add: `.mypy_cache/`, `.ruff_cache/`.
+
+### 1.7 Imports — DONE
+
+Code already uses `rabbitllm` package paths; no `rabbit_llm` references in source.
+
+### Phase 1 verification (after completing pending items)
+
+- `uv sync --extra dev` (or `make install`) installs cleanly
+- `make lint` and `make format` pass
+- `make test` — existing tests pass
+- `uv run python -c "from rabbitllm import AutoModel"` works
 
 ---
 
@@ -141,31 +114,31 @@ New test files: `test_model_registry.py`, `test_compression.py`, `test_platform.
 
 ### Verification
 
-- `pytest tests/ --cov=newproject` — >80% coverage on targeted modules
-- `mypy src/newproject/ --ignore-missing-imports` — passes
+- `pytest tests/ --cov=rabbitllm` — >80% coverage on targeted modules
+- `mypy src/rabbitllm/ --ignore-missing-imports` — passes
 - Manual: load TinyLlama-1.1B, verify generation works through refactored code
 
 ---
 
 ## Phase 3: New Features — CLI + API Server
 
-### 3.1 CLI with Typer (`src/newproject/cli.py`)
+### 3.1 CLI with Typer (`src/rabbitllm/cli.py`)
 
 Commands:
 
-- `newproject run <model> [-p prompt] [-n max_tokens] [-c 4bit|8bit] [-i interactive]`
-- `newproject pull <model>` — download + prepare
-- `newproject list` — show local models
-- `newproject remove <model>`
-- `newproject serve <model> [--host] [--port]`
+- `rabbitllm run <model> [-p prompt] [-n max_tokens] [-c 4bit|8bit] [-i interactive]`
+- `rabbitllm pull <model>` — download + prepare
+- `rabbitllm list` — show local models
+- `rabbitllm remove <model>`
+- `rabbitllm serve <model> [--host] [--port]`
 
-### 3.2 Model manager (`src/newproject/model_manager.py`)
+### 3.2 Model manager (`src/rabbitllm/model_manager.py`)
 
 `ModelManager` class: `pull()`, `list_models()`, `remove()`, `get_model_path()` — manages local model cache.
 
 ### 3.3 FastAPI server with OpenAI-compatible API
 
-New `src/newproject/server/` package:
+New `src/rabbitllm/server/` package:
 
 - `app.py` — FastAPI app factory
 - `routes.py` — `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`, `GET /health`
@@ -176,7 +149,7 @@ New `src/newproject/server/` package:
 
 New `generate_stream()` method on `BaseModel` — yields decoded tokens one at a time. Each token requires a full layer-streaming forward pass (inherent to the architecture). Server uses SSE via `sse-starlette`.
 
-### 3.5 Chat template support (`src/newproject/chat.py`)
+### 3.5 Chat template support (`src/rabbitllm/chat.py`)
 
 `ChatFormatter` class: uses `tokenizer.apply_chat_template()` if available, falls back to generic formatting.
 
@@ -186,9 +159,9 @@ In `cli.py` with `--interactive` flag: Rich-based REPL with conversation history
 
 ### Verification
 
-- `newproject pull meta-llama/Llama-3.2-1B` — downloads model
-- `newproject run meta-llama/Llama-3.2-1B -p "Hello"` — generates text
-- `newproject serve meta-llama/Llama-3.2-1B` → `curl localhost:8000/v1/chat/completions` — works
+- `rabbitllm pull meta-llama/Llama-3.2-1B` — downloads model
+- `rabbitllm run meta-llama/Llama-3.2-1B -p "Hello"` — generates text
+- `rabbitllm serve meta-llama/Llama-3.2-1B` → `curl localhost:8000/v1/chat/completions` — works
 - Streaming: `"stream": true` returns SSE events
 - `pytest tests/test_cli.py tests/test_server.py tests/test_chat.py` — passes
 
@@ -220,7 +193,7 @@ Dev setup, running tests, code style, how to add a new model.
 
 ### Verification
 
-- `docker build -t newproject . && docker run --gpus all newproject serve ...` — works
+- `docker build -t rabbitllm . && docker run --gpus all rabbitllm serve ...` — works
 - All docs render on GitHub
 - `make test && make lint && make typecheck` — full CI green
 
@@ -228,15 +201,14 @@ Dev setup, running tests, code style, how to add a new model.
 
 ## Critical Files (current paths)
 
-| File | LOC | What happens to it |
-|------|-----|--------------------|
-| `rabbit_llm/rabbitllm/rabbitllm_base.py` | 642 | → `src/newproject/engine/base.py` — heaviest refactor (forward decomposition, logging, types, config-driven) |
-| `rabbit_llm/rabbitllm/utils.py` | 403 | → split into `utils/memory.py`, `compression.py`, `splitting.py`, `platform.py` — bug fix, logging, types |
-| `rabbit_llm/rabbitllm/rabbitllm_llama_mlx.py` | 436 | → `src/newproject/engine/mlx_engine.py` — logging, types |
-| `rabbit_llm/rabbitllm/auto_model.py` | 55 | → `src/newproject/models/registry.py` — config-driven rewrite, typo fix |
-| `rabbit_llm/rabbitllm/persist/model_persister.py` | 39 | → `src/newproject/persist/base.py` — ABC conversion, remove global state |
-| `rabbit_llm/setup.py` | 49 | **Deleted** — replaced by `pyproject.toml` |
-| 8 model subclass files | ~220 | Phase 1: move to `models/`. Phase 2: consolidate into `models/configs.py` |
+| File | What happens to it |
+|------|--------------------|
+| `src/rabbitllm/engine/base.py` | Phase 2: forward decomposition, logging, types, config-driven |
+| `src/rabbitllm/utils/*.py` | Phase 2: bug fix (splitting), logging, types |
+| `src/rabbitllm/engine/mlx_engine.py` | Phase 2: logging, types |
+| `src/rabbitllm/models/registry.py` | Phase 2: typo fix ("artichitecture"), config-driven optional |
+| `src/rabbitllm/persist/base.py` | Phase 2: ABC conversion, remove global state |
+| 8 model subclass files in `models/` | Phase 2: optional consolidate into `models/configs.py` |
 
 ## Phase Dependencies
 

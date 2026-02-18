@@ -8,10 +8,13 @@ RabbitLLM enables running large language models (70B+ parameters) on GPUs with a
 
 ## Build & Install
 
+The project uses **uv** as the package manager. Makefile targets (`make install`, `make test`, etc.) run via `uv sync` and `uv run`.
+
 ```bash
-# Install from source (editable mode)
+# Install from source (editable mode, with dev tools)
 cd airllm  # or project root
-pip install -e .
+uv sync --extra dev
+# or: make install
 
 # Install from PyPI
 pip install rabbitllm
@@ -21,15 +24,16 @@ Note: The project supports `transformers>=4.47,<4.49`. For Qwen2/Qwen2.5 with 4.
 
 ## Running Tests
 
-Tests use unittest and live in `src/tests/`. The compression test requires a CUDA GPU.
+Tests use unittest and live in `tests/`. The compression test requires a CUDA GPU.
 
 ```bash
 # Run all tests
-python -m pytest src/tests/
+uv run pytest tests/
+# or: make test
 
 # Run a single test module
-python -m unittest src.tests.test_automodel
-python -m unittest src.tests.test_compression
+uv run python -m unittest tests.test_model_registry
+uv run python -m unittest tests.test_compression
 ```
 
 ## Architecture
