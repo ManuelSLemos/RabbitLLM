@@ -27,6 +27,14 @@ from ..utils import clean_memory, load_layer, find_or_create_local_splitted_path
 logger = logging.getLogger(__name__)
 
 
+def get_rope_theta_from_config(config) -> float:
+    """Read rope_theta from config (v5: rope_parameters dict; v4: rope_theta attr)."""
+    rp = getattr(config, "rope_parameters", None)
+    if rp is not None and isinstance(rp, dict):
+        return float(rp.get("rope_theta", 10000.0))
+    return float(getattr(config, "rope_theta", 10000.0))
+
+
 @dataclass
 class ModelArgs:
     dim: int
@@ -71,6 +79,7 @@ def get_model_args_from_config(config):
     params["vocab_size"] = config.vocab_size
     params["norm_eps"] = config.rms_norm_eps
     params["rope_traditional"] = False
+    params["rope_theta"] = get_rope_theta_from_config(config)
 
     sconfig = sanitize_config(params)
 
@@ -234,6 +243,7 @@ class RabbitLLMLlamaMlx:
         layer_shards_saving_path=None,
         profiling_mode=False,
         compression=None,
+        token=None,
         hf_token=None,
         prefetching=True,
         test_nonlayered=False,
@@ -241,7 +251,8 @@ class RabbitLLMLlamaMlx:
         delete_original=False,
     ):
 
-        self.hf_token = hf_token
+        self._token = token if token is not None else hf_token
+        self.hf_token = self._token  # backward compatibility
         self.set_layer_names_dict()
         self.test_nonlayered = test_nonlayered
         self.show_memory_util = show_memory_util
@@ -253,12 +264,12 @@ class RabbitLLMLlamaMlx:
             layer_shards_saving_path,
             compression=compression,
             layer_names=self.layer_names_dict,
-            hf_token=hf_token,
+            token=self._token,
             delete_original=delete_original,
         )
-        if hf_token is not None:
+        if self._token is not None:
             self.config = AutoConfig.from_pretrained(
-                self.model_local_path, token=hf_token, trust_remote_code=True
+                self.model_local_path, token=self._token, trust_remote_code=True
             )
         else:
             self.config = AutoConfig.from_pretrained(self.model_local_path, trust_remote_code=True)
@@ -274,15 +285,14 @@ class RabbitLLMLlamaMlx:
             + [self.layer_names_dict["norm"], self.layer_names_dict["lm_head"]]
         )
 
-        self.tokenizer = self.get_tokenizer(hf_token=hf_token)
+        self.tokenizer = self.get_tokenizer(token=self._token)
 
-    def get_tokenizer(self, hf_token=None):
-        if hf_token is not None:
+    def get_tokenizer(self, token=None):
+        if token is not None:
             return AutoTokenizer.from_pretrained(
-                self.model_local_path, token=hf_token, trust_remote_code=True
+                self.model_local_path, token=token, trust_remote_code=True
             )
-        else:
-            return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
+        return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
 
     def generate(self, x, temperature=0, max_new_tokens=None, **kwargs):
         tokens = []

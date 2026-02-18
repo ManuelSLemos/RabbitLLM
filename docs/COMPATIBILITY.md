@@ -16,13 +16,17 @@ Upgrading to 4.47 from 4.46 brings:
 
 ## Gated models
 
-Some repos (e.g. Meta Llama, certain Gemma variants) are gated. Use a Hugging Face token: pass `hf_token="hf_..."` to `from_pretrained()` or set the `HF_TOKEN` environment variable. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#gated-models-hugging-face).
+Some repos (e.g. Meta Llama, certain Gemma variants) are gated. Use a Hugging Face token: pass `token="hf_..."` (preferred; required in transformers v5) or `hf_token="hf_..."` for backward compatibility, or set the `HF_TOKEN` environment variable. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#gated-models-hugging-face).
 
 ## Dependencies
 
 - **accelerate** ≥ 0.26 (needed for transformers 4.46).
 - **sentencepiece** (required for Baichuan tokenizer; add to project dependencies if you use Baichuan).
 - **flash-attn** (optional): for `attn_implementation="flash_attention_2"`; requires Ampere+ GPU and fp16/bf16.
+
+## Requirements for transformers v5 (when upgrading)
+
+When moving to `transformers>=5.0`, ensure: Python 3.10+, PyTorch 2.4+, **accelerate** ≥ 1.1.0, **peft** ≥ 0.18.0 (if using PEFT), **bitsandbytes** ≥ 0.46.1 (if using quantization). See [TRANSFORMERS_UPGRADE_PLAN.md](TRANSFORMERS_UPGRADE_PLAN.md).
 
 ## Model compatibility matrix
 

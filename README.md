@@ -140,7 +140,7 @@ When initialize the model, we support the following configurations:
 * **compression**: supported options: 4bit, 8bit for 4-bit or 8-bit block-wise quantization, or by default None for no compression
 * **profiling_mode**: supported options: True to output time consumptions or by default False
 * **layer_shards_saving_path**: optionally another path to save the splitted model
-* **hf_token**: huggingface token can be provided here if downloading gated models like: *meta-llama/Llama-2-7b-hf*
+* **token** (or **hf_token**): Hugging Face token for gated repos (e.g. *meta-llama/Llama-2-7b-hf*). Prefer `token` for new code (required in transformers v5).
 * **prefetching**: prefetching to overlap the model loading and compute. By default, turned on. For now, only RabbitLLMLlama2 supports this.
 * **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
 
@@ -301,10 +301,10 @@ AutoModel.from_pretrained(...)
 
 ### 3. 401 Client Error....Repo model ... is gated.
 
-Some models are gated models, needs huggingface api token. You can provide hf_token:
+Some models are gated models, needs Hugging Face API token. You can provide `token` (or `hf_token` for backward compatibility):
 
 ```python
-model = AutoModel.from_pretrained("meta-llama/Llama-2-7b-hf", #hf_token='HF_API_TOKEN')
+model = AutoModel.from_pretrained("meta-llama/Llama-2-7b-hf", token="HF_API_TOKEN")
 ```
 
 ### 4. ValueError: Asking to pad but the tokenizer does not have a padding token.

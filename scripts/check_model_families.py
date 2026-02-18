@@ -38,9 +38,9 @@ MODELS = {
 
 
 def _hf_kwargs(token: str | None) -> dict:
-    """Build kwargs for gated repos: hf_token from --token or HF_TOKEN env."""
+    """Build kwargs for gated repos: token from --token or HF_TOKEN env."""
     t = token or os.environ.get("HF_TOKEN", "").strip()
-    return {"hf_token": t} if t else {}
+    return {"token": t} if t else {}
 
 
 def check_registry(hf_kwargs: dict):

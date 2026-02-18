@@ -135,7 +135,7 @@ So it is **normal** for small models (e.g. Qwen2.5-0.5B) to be faster on CPU in 
 
 1. Accept the model’s license on [huggingface.co](https://huggingface.co) and create a token (Settings → Access tokens).
 2. Pass the token when using RabbitLLM:
-   - **Code**: `AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", hf_token="hf_...")`
+   - **Code**: `AutoModel.from_pretrained("meta-llama/Llama-3.2-1B", token="hf_...")` (or `hf_token="hf_..."` for backward compatibility)
    - **Env**: `HF_TOKEN=hf_... python your_script.py` (scripts that read `os.environ.get("HF_TOKEN")` will use it).
    - **CLI** (when available): `--token hf_...` or `HF_TOKEN=hf_... rabbit ...`.
 

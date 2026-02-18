@@ -84,6 +84,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         layer_shards_saving_path: Optional[Union[str, Path]] = None,
         profiling_mode: bool = False,
         compression: Optional[str] = None,
+        token: Optional[str] = None,
         hf_token: Optional[str] = None,
         prefetching: bool = True,
         delete_original: bool = False,
@@ -103,7 +104,8 @@ class RabbitLLMBaseModel(GenerationMixin):
             layer_shards_saving_path: Where to save split layers. Default: model cache subdir.
             profiling_mode: If True, record load/forward timing in self.profiler.
             compression: "4bit" or "8bit" for quantized layers (requires bitsandbytes).
-            hf_token: HuggingFace token for gated repos.
+            token: HuggingFace token for gated repos (preferred; v5 uses this). Use ``hf_token`` for backward compatibility.
+            hf_token: Deprecated alias for ``token``; use ``token`` for new code.
             prefetching: Overlap layer load with compute when CUDA available.
             delete_original: If True, delete original checkpoint after splitting.
             attn_implementation: "auto", "flash_attention_2", "sdpa", or "eager".
@@ -128,7 +130,8 @@ class RabbitLLMBaseModel(GenerationMixin):
                 )
 
         self.compression = compression
-        self.hf_token = hf_token
+        self._token = token if token is not None else hf_token
+        self.hf_token = self._token  # backward compatibility
         self._persister = persister if persister is not None else ModelPersister.get_model_persister()
 
         # Save parameters
@@ -140,7 +143,7 @@ class RabbitLLMBaseModel(GenerationMixin):
             layer_shards_saving_path,
             compression=compression,
             layer_names=self.layer_names_dict,
-            hf_token=hf_token,
+            hf_token=self._token,
             delete_original=delete_original,
         )
         # Use CPU if CUDA was requested but is not available or fails to init
@@ -165,9 +168,9 @@ class RabbitLLMBaseModel(GenerationMixin):
         self.device = torch.device(self.running_device)
 
         # Create model
-        if hf_token is not None:
+        if self._token is not None:
             self.config = AutoConfig.from_pretrained(
-                self.model_local_path, token=hf_token, trust_remote_code=True
+                self.model_local_path, token=self._token, trust_remote_code=True
             )
         else:
             self.config = AutoConfig.from_pretrained(self.model_local_path, trust_remote_code=True)
@@ -186,7 +189,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         self.generation_config = self.get_generation_config()
         # print(f"using generation_config: {self.generation_config}")
 
-        self.tokenizer = self.get_tokenizer(hf_token=hf_token)
+        self.tokenizer = self.get_tokenizer(token=self._token)
 
         self.init_model()
 
@@ -230,10 +233,10 @@ class RabbitLLMBaseModel(GenerationMixin):
             return GenerationConfig()
 
     # a chance to customize tokenizer
-    def get_tokenizer(self, hf_token=None):
-        if hf_token is not None:
+    def get_tokenizer(self, token=None):
+        if token is not None:
             return AutoTokenizer.from_pretrained(
-                self.model_local_path, token=hf_token, trust_remote_code=True
+                self.model_local_path, token=token, trust_remote_code=True
             )
         else:
             return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)

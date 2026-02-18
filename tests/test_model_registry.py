@@ -25,8 +25,8 @@ class TestAutoModel(unittest.TestCase):
             "mistralai/Mistral-7B-Instruct-v0.1": "RabbitLLMMistral",
             "mistralai/Mixtral-8x7B-v0.1": "RabbitLLMMixtral",
         }
-        hf_token = os.environ.get("HF_TOKEN", "").strip() or None
-        kwargs = {"hf_token": hf_token} if hf_token else {}
+        token = os.environ.get("HF_TOKEN", "").strip() or None
+        kwargs = {"token": token} if token else {}
 
         for k, v in mapping_dict.items():
             try:

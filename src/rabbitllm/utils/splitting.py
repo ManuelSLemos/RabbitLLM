@@ -113,6 +113,7 @@ def split_and_save_layers(
     layer_names: Optional[Dict[str, str]] = None,
     delete_original: bool = False,
     repo_id: Optional[str] = None,
+    token: Optional[str] = None,
     hf_token: Optional[str] = None,
 ) -> str:
     """Split a sharded checkpoint into per-layer safetensors and save to disk.
@@ -125,11 +126,13 @@ def split_and_save_layers(
         layer_names: Dict with embed, layer_prefix, norm, lm_head keys; inferred if None.
         delete_original: If True, remove original shard files after saving each layer.
         repo_id: HuggingFace repo ID for re-downloading missing shards.
-        hf_token: HuggingFace token for gated repos.
+        token: HuggingFace token for gated repos (preferred; v5 uses this).
+        hf_token: Deprecated alias for ``token``.
 
     Returns:
         Path to the directory containing the split layer files (as string).
     """
+    _token = token if token is not None else hf_token
 
     if compression is not None:
         assert bitsandbytes_installed, "when using compression bitsandbytes has to be installed."
@@ -275,7 +278,7 @@ def split_and_save_layers(
                     if not os.path.exists(to_load):
                         assert repo_id is not None
                         huggingface_hub.snapshot_download(
-                            repo_id, allow_patterns=os.path.basename(to_load), token=hf_token
+                            repo_id, allow_patterns=os.path.basename(to_load), token=_token
                         )
 
                     if not safetensors_format:
@@ -290,7 +293,7 @@ def split_and_save_layers(
                 if not os.path.exists(to_load):
                     assert repo_id is not None
                     huggingface_hub.snapshot_download(
-                        repo_id, allow_patterns=os.path.basename(to_load), token=hf_token
+                        repo_id, allow_patterns=os.path.basename(to_load), token=_token
                     )
                 if not safetensors_format:
                     state_dict.update(torch.load(to_load, map_location="cpu"))
@@ -324,6 +327,7 @@ def find_or_create_local_splitted_path(
     layer_shards_saving_path: Optional[Union[Path, str]] = None,
     compression: Optional[str] = None,
     layer_names: Optional[Dict[str, str]] = None,
+    token: Optional[str] = None,
     hf_token: Optional[str] = None,
     delete_original: bool = False,
 ) -> Tuple[Path, str]:
@@ -337,12 +341,14 @@ def find_or_create_local_splitted_path(
         layer_shards_saving_path: Optional base path for split output.
         compression: "4bit" or "8bit" for quantized layers.
         layer_names: Dict for layer naming; inferred if None.
-        hf_token: HuggingFace token for gated repos.
+        token: HuggingFace token for gated repos (preferred; v5 uses this).
+        hf_token: Deprecated alias for ``token``.
         delete_original: If True, delete original shards after splitting.
 
     Returns:
         Tuple of (model_local_path, split_dir_path) where split_dir_path is the split output.
     """
+    _token = token if token is not None else hf_token
 
     if os.path.exists(model_local_path_or_repo_id):
         has_index = os.path.exists(
@@ -365,7 +371,7 @@ def find_or_create_local_splitted_path(
             )
 
     hf_cache_path = huggingface_hub.snapshot_download(
-        model_local_path_or_repo_id, token=hf_token, ignore_patterns=["*.safetensors", "*.bin"]
+        model_local_path_or_repo_id, token=_token, ignore_patterns=["*.safetensors", "*.bin"]
     )
 
     has_index = os.path.exists(
@@ -373,7 +379,7 @@ def find_or_create_local_splitted_path(
     ) or os.path.exists(Path(hf_cache_path) / "model.safetensors.index.json")
     if not has_index:
         hf_cache_path = huggingface_hub.snapshot_download(
-            model_local_path_or_repo_id, token=hf_token, allow_patterns=["model.safetensors"]
+            model_local_path_or_repo_id, token=_token, allow_patterns=["model.safetensors"]
         )
 
     return Path(hf_cache_path), split_and_save_layers(
@@ -383,5 +389,5 @@ def find_or_create_local_splitted_path(
         layer_names=layer_names,
         delete_original=delete_original,
         repo_id=model_local_path_or_repo_id,
-        hf_token=hf_token,
+        token=_token,
     )

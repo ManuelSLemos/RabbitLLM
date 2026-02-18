@@ -25,8 +25,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import sentencepiece as spm
 
-from transformers.tokenization_utils import AddedToken, PreTrainedTokenizer
 from transformers.utils import logging
+
+try:
+    from transformers.tokenization_utils import AddedToken, PreTrainedTokenizer
+except ImportError:
+    # v5: tokenizers consolidated; PythonBackend was formerly PreTrainedTokenizer
+    from transformers.tokenization_utils import AddedToken
+    from transformers.tokenization_python import PythonBackend as PreTrainedTokenizer
 
 
 logger = logging.get_logger(__name__)
