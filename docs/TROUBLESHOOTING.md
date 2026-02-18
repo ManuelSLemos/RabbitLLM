@@ -93,6 +93,30 @@ After a `generate()` call, the profiler prints total time per category:
 
 Use these to decide whether to optimize disk I/O, CPU→VRAM copy, or attention implementation.
 
+## CPU vs CUDA: when is CPU faster?
+
+**Symptom**: Inference with `device="cuda:0"` feels slower than with `device="cpu"` for the same model and prompt.
+
+**Cause**: In layer-streaming, **every** forward pass (each generated token) loads all layers from disk and moves them to the device. There is no persistent GPU residency of weights. So the cost per step is:
+
+- **Disk read** → **CPU→GPU transfer** (PCIe) → **compute**
+
+For **small models** (e.g. 0.5B parameters) and short sequences:
+
+1. Each layer does very little compute on the GPU, so the GPU is underutilized.
+2. The time to copy each layer from CPU to GPU can be **larger** than the time to run the layer on the GPU.
+3. On CPU you avoid that transfer: data stays in RAM, so you only pay disk→RAM and compute. For 0.5B, CPU compute is often fast enough that **total time is lower on CPU**.
+
+So it is **normal** for small models (e.g. Qwen2.5-0.5B) to be faster on CPU in this architecture. CUDA tends to win for larger models (e.g. 1.5B–3B+) where the compute per layer dominates over transfer.
+
+**What to do**:
+
+- For **small models** and low latency: use `device="cpu"` and pass inputs on CPU (e.g. `input_ids` without `.cuda()`).
+- To **compare** on your machine: run the benchmark script:
+  - `uv run python scripts/benchmark_cpu_vs_cuda.py` (default: Qwen2.5-0.5B, 2 runs per device).
+  - Options: `--model`, `--max-new-tokens`, `--runs`, `--cpu-only`, `--cuda-only`.
+- For **larger models** or longer generations, CUDA usually becomes faster; the benchmark helps you see the crossover.
+
 ## Gated models (Hugging Face)
 
 **Symptom**: `Cannot access gated repo` or `Access to model X is restricted. You must have access to it and be authenticated.`

@@ -91,7 +91,7 @@ Critical design decisions are documented in `docs/`:
 
 - **`docs/ARCHITECTURE.md`** — Relationship with HuggingFace (we use HF for model definitions, only customize loading and forward loop). Why we **do not** call `tie_weights()` and how tied `lm_head` is handled. KV cache (DynamicCache) and attention implementations (eager float mask, SDPA with mask=None, flash).
 - **`docs/COMPATIBILITY.md`** — Transformers version (4.47+). Model compatibility matrix. Qwen2 4.47+ (position_embeddings, KV cache fallback). Single-file checkpoints.
-- **`docs/TROUBLESHOOTING.md`** — Zero logits (tied weights), eager mask, KV cache empty list, SDPA/cache alignment, dtype, single-file splits. How to debug forward vs HF.
+- **`docs/TROUBLESHOOTING.md`** — Zero logits (tied weights), eager mask, KV cache empty list, SDPA/cache alignment, dtype, single-file splits. CPU vs CUDA: when CPU is faster (layer-streaming transfer overhead). How to debug forward vs HF. Benchmark: `scripts/benchmark_cpu_vs_cuda.py`.
 
 When changing loading, cache, or attention logic, check these docs to avoid regressions (e.g. QWen v1 / ChatGLM use custom cache kwargs).
 
