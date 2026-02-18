@@ -30,5 +30,10 @@ class SafetensorModelPersister(ModelPersister):
         (saving_path / (layer_name + "safetensors.done")).touch()
 
     def load_model(self, layer_name, path):
-        layer_state_dict = load_file(Path(path) / (layer_name + ".safetensors"), device="cpu")
-        return layer_state_dict
+        base = Path(path)
+        # Current format: layer_name + "safetensors" (no dot); legacy: layer_name + ".safetensors"
+        for name in (layer_name + "safetensors", layer_name + ".safetensors"):
+            candidate = base / name
+            if candidate.exists():
+                return load_file(candidate, device="cpu")
+        return load_file(base / (layer_name + "safetensors"), device="cpu")

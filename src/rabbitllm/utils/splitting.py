@@ -26,9 +26,10 @@ from ..persist import ModelPersister
 
 
 def remove_real_and_linked_file(to_delete: Union[Path, str]) -> None:
+    to_delete_str = str(to_delete)
     targetpath = None
-    if os.path.realpath(to_delete) != to_delete:
-        targetpath = os.path.realpath(to_delete)
+    if os.path.realpath(to_delete_str) != to_delete_str:
+        targetpath = os.path.realpath(to_delete_str)
 
     os.remove(to_delete)
     if targetpath:
