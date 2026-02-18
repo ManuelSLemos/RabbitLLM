@@ -72,6 +72,10 @@ The package uses platform detection (`sys.platform == "darwin"`) in both `__init
 
 `src/rabbitllm/persist/` contains `ModelPersister` (abstract), `SafetensorModelPersister` (default), and `MlxModelPersister` (macOS) for reading/writing split layer files.
 
+### Local model cache
+
+To avoid re-downloading models and keep them out of git: the repo has `models/` and `.models/` in `.gitignore`. Users can set `HF_HOME="$(pwd)/models"` so Hugging Face and RabbitLLM use that directory; see [README.md](README.md#local-model-cache).
+
 ### Device and Docker
 
 - If CUDA is requested but unavailable or fails to init, the engine falls back to `device="cpu"` and logs a warning (see [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)).

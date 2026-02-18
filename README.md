@@ -47,6 +47,7 @@
 * [Quick start](#quickstart)
 * [Model Compression](#model-compression---3x-inference-speed-up)
 * [Configurations](#configurations)
+* [Local model cache](#local-model-cache)
 * [Run on MacOS](#macos)
 * [Example notebooks](#example-python-notebook)
 * [Supported Models](#supported-models)
@@ -142,6 +143,24 @@ When initialize the model, we support the following configurations:
 * **hf_token**: huggingface token can be provided here if downloading gated models like: *meta-llama/Llama-2-7b-hf*
 * **prefetching**: prefetching to overlap the model loading and compute. By default, turned on. For now, only RabbitLLMLlama2 supports this.
 * **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
+
+## Local model cache
+
+To avoid re-downloading models and keep the cache **out of the repository** (not committed to git), use one of these options.
+
+**Option 1 — Cache inside the project (recommended)**  
+The repo has a `models/` directory for this; it is in `.gitignore`, so nothing you put there is committed. Before running scripts or notebooks from the repo root:
+
+```bash
+export HF_HOME="$(pwd)/models"
+```
+
+Downloads and RabbitLLM split layers will then live under `./models/` and won’t be re-downloaded. To load from that path later, use the local path: `AutoModel.from_pretrained("./models/...")` (exact subdir name depends on Hugging Face, e.g. `models--org--repo-name`).
+
+**Option 2 — Global cache**  
+By default Hugging Face uses `~/.cache/huggingface/hub/`. The first download goes there and later runs reuse it; that path is outside the repo. To use a different global cache: `export HF_HOME=~/.cache/rabbitllm`.
+
+**Summary:** Use `export HF_HOME="$(pwd)/models"` for a project-local cache; `models/` and `.models/` are already in `.gitignore`.
 
 ## MacOS
 
