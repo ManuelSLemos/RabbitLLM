@@ -72,11 +72,17 @@ def load_and_generate(device: str, hf_kwargs: dict):
         messages, tokenize=False, add_generation_prompt=True
     )
     inputs = model.tokenizer(
-        [text], return_tensors="pt", return_attention_mask=False, truncation=True, max_length=128
+        [text], return_tensors="pt", truncation=True, max_length=128
     )
+    input_ids = inputs["input_ids"].to(device)
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
+    else:
+        attention_mask = attention_mask.to(device)
     t1 = time.perf_counter()
     out = model.generate(
-        inputs["input_ids"].to(device), max_new_tokens=10, use_cache=True, do_sample=False
+        input_ids, attention_mask=attention_mask, max_new_tokens=10, use_cache=True, do_sample=False
     )
     gen_s = time.perf_counter() - t1
     reply = model.tokenizer.decode(out.sequences[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)

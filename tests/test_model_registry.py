@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from rabbitllm import AutoModel
@@ -24,7 +25,16 @@ class TestAutoModel(unittest.TestCase):
             "mistralai/Mistral-7B-Instruct-v0.1": "RabbitLLMMistral",
             "mistralai/Mixtral-8x7B-v0.1": "RabbitLLMMixtral",
         }
+        hf_token = os.environ.get("HF_TOKEN", "").strip() or None
+        kwargs = {"hf_token": hf_token} if hf_token else {}
 
         for k, v in mapping_dict.items():
-            module_name, cls = AutoModel.get_module_class(k)
-            self.assertEqual(cls, v, f"expecting {v} for {k}")
+            try:
+                module_name, cls = AutoModel.get_module_class(k, **kwargs)
+                self.assertEqual(cls, v, f"expecting {v} for {k}")
+            except OSError as e:
+                err_msg = str(e).lower()
+                if "gated" in err_msg or ("access" in err_msg and "token" in err_msg):
+                    # Skip gated repos when no HF_TOKEN; other models still run
+                    continue
+                raise

@@ -32,14 +32,20 @@ input_text = model.tokenizer.apply_chat_template(
 input_tokens = model.tokenizer(
     [input_text],
     return_tensors="pt",
-    return_attention_mask=False,
     truncation=True,
     max_length=MAX_LENGTH,
 )
+input_ids = input_tokens["input_ids"].to(device)
+attention_mask = input_tokens.get("attention_mask")
+if attention_mask is None:
+    attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
+else:
+    attention_mask = attention_mask.to(device)
 
 t1 = time.perf_counter()
 generation_output = model.generate(
-    input_tokens["input_ids"].to(device),
+    input_ids,
+    attention_mask=attention_mask,
     max_new_tokens=50,
     use_cache=True,
     do_sample=False,

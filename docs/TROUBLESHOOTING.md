@@ -44,6 +44,14 @@ Common issues and how they were addressed in the codebase.
 
 **Fix**: Use a context manager that temporarily sets the attention module’s `layer_idx` to `0` for the duration of the layer call, then restores it. So every streamed layer updates the cache at index 0. See `_layer_idx_as_zero()` in the base class.
 
+## KV cache not filled / no incremental decoding
+
+**Symptom**: A warning appears once during generation: *"KV cache was not filled by decoder layers; returning past_key_values=None. Generation will work but each step re-runs the full forward (no incremental decoding)."*
+
+**Cause**: This is a **known limitation** with **Qwen2 / Qwen2.5** and **transformers 4.47+** in layer-streaming mode. The decoder layers may not fill the `DynamicCache` we pass; the engine then returns `past_key_values=None` and logs the warning. Generation is correct but each new token re-runs the full forward (no KV cache reuse), so throughput is lower.
+
+**What to do**: No fix is required. The warning is informational. See [COMPATIBILITY.md](COMPATIBILITY.md) (Qwen2 / Qwen2.5 with transformers 4.47+) for details. A future code change may restore KV cache for these models in streaming mode.
+
 ## CUDA error: device-side assert (inf/nan in logits or sampling)
 
 **Symptom**: `CUDA error: device-side assert triggered`, often in sampling, with a message about probability tensor containing inf, nan, or values &lt; 0.
@@ -75,6 +83,8 @@ To get the lowest latency per token:
 3. **Compression trade-off**: If you use `compression='4bit'` or `'8bit'`, prefetching is **disabled** in the code (see `rabbitllm_base.py`). For lowest latency, try **without** compression first; prefetch often outweighs the benefit of smaller layer files. Use compression when disk I/O is the clear bottleneck and you have measured it via `profiling_mode=True`.
 
 4. **Disk and model size**: Keep the split model on a fast **local SSD** (Hugging Face cache or `layer_shards_saving_path`). Use smaller models (e.g. 0.5B–7B) for “response in seconds”; 70B will always be slower due to layer count.
+
+5. **Attention mask when pad_token = eos_token**: If the tokenizer has `pad_token_id == eos_token_id` (common for Qwen and other decoder-only models), pass an explicit `attention_mask` to `model.generate()` to avoid the Transformers warning and ensure reliable behavior. The example scripts in `scripts/` do this (they request the mask from the tokenizer and pass it to `generate()`; if the tokenizer does not return one, use a mask of ones with the same shape as `input_ids`).
 
 ### Finding the bottleneck with the profiler
 

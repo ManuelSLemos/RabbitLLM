@@ -15,6 +15,7 @@ Usage:
 import argparse
 import time
 
+import torch
 from rabbitllm import AutoModel
 
 
@@ -30,15 +31,20 @@ def run_benchmark(device: str, model_id: str, prompt: str, max_new_tokens: int, 
     inputs = tokenizer(
         [prompt],
         return_tensors="pt",
-        return_attention_mask=False,
         truncation=True,
         max_length=256,
     )
     input_ids = inputs["input_ids"].to(model.device)
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=model.device)
+    else:
+        attention_mask = attention_mask.to(model.device)
 
     # Warmup
     model.generate(
         input_ids,
+        attention_mask=attention_mask,
         max_new_tokens=max_new_tokens,
         use_cache=True,
         return_dict_in_generate=True,
@@ -50,6 +56,7 @@ def run_benchmark(device: str, model_id: str, prompt: str, max_new_tokens: int, 
         start = time.perf_counter()
         out = model.generate(
             input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             use_cache=True,
             return_dict_in_generate=True,
