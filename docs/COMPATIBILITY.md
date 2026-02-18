@@ -2,12 +2,12 @@
 
 ## Transformers version
 
-- **Supported**: `transformers>=4.47,<4.58` (e.g. 4.47.x through 4.57.x).
-- **Recommended**: Use the latest patch (e.g. 4.56.x or 4.57.x) for the widest model support (Qwen3, DeepSeek V3, Gemma2/3, Phi3, Llama 3.2, etc.).
+- **Supported**: `transformers>=5.0,<5.1` (5.0.x only).
+- **5.1.x / 5.2.x**: Not supported for Qwen2/Qwen2.5 layer-streaming due to a RoPE/head_dim mismatch in the attention layer (`apply_rotary_pos_emb` 14 vs 64). A fix is pending; use 5.0.x for Qwen2/Qwen2.5 until then.
 
-In 4.50+, `GenerationMixin` may need to be imported from `transformers.generation.utils`; the codebase tries both import paths.
+The codebase uses `GenerationMixin` from `transformers.generation.utils` (with fallback from `transformers`) and `Cache`/`DynamicCache` from `transformers.cache_utils`.
 
-Upgrading to 4.47 from 4.46 brings:
+Previous 4.x support (reference). Upgrading to 4.47 from 4.46 brought:
 
 - Better support for Qwen2.5, Llama 3.x, and modern configs (e.g. rope_scaling).
 - Native SDPA and FlashAttention 2 integration.
@@ -20,13 +20,13 @@ Some repos (e.g. Meta Llama, certain Gemma variants) are gated. Use a Hugging Fa
 
 ## Dependencies
 
-- **accelerate** ≥ 0.26 (needed for transformers 4.46).
+- **accelerate** ≥ 1.1.0 (required for transformers 5.x).
 - **sentencepiece** (required for Baichuan tokenizer; add to project dependencies if you use Baichuan).
 - **flash-attn** (optional): for `attn_implementation="flash_attention_2"`; requires Ampere+ GPU and fp16/bf16.
 
-## Requirements for transformers v5 (when upgrading)
+## Requirements for transformers 5.x
 
-When moving to `transformers>=5.0`, ensure: Python 3.10+, PyTorch 2.4+, **accelerate** ≥ 1.1.0, **peft** ≥ 0.18.0 (if using PEFT), **bitsandbytes** ≥ 0.46.1 (if using quantization). See [TRANSFORMERS_UPGRADE_PLAN.md](TRANSFORMERS_UPGRADE_PLAN.md).
+This project targets `transformers>=5.0`. Ensure: Python 3.10+, PyTorch 2.0+ (2.4+ recommended), **accelerate** ≥ 1.1.0, **peft** ≥ 0.18.0 (if using PEFT), **bitsandbytes** ≥ 0.46.1 (if using quantization). See [TRANSFORMERS_UPGRADE_PLAN.md](TRANSFORMERS_UPGRADE_PLAN.md).
 
 ## Model compatibility matrix
 
@@ -50,7 +50,15 @@ When moving to `transformers>=5.0`, ensure: Python 3.10+, PyTorch 2.4+, **accele
 ### Qwen2 / Qwen2.5 with transformers 4.47+
 
 - Decoder layers expect **`position_embeddings`** (cos, sin tuple) from RoPE; `RabbitLLMQWen2` overrides `get_pos_emb_args()` to compute and pass them.
+- **RoPE head_dim**: Some configs set `head_dim` to `num_attention_heads` (e.g. 14) instead of `hidden_size // num_attention_heads` (e.g. 64), causing a shape mismatch in `apply_rotary_pos_emb`. The engine applies several fixes: (1) set `config.head_dim` to the canonical value in `__init__` and at the start of `init_model()`; (2) `_fix_attention_head_dim()` forces the same value on all decoder `self_attn` modules after creating the model and at the start of the layer loop; (3) Qwen2’s `get_pos_emb_args()` uses the canonical head_dim and treats `head_dim == num_attention_heads` as wrong and uses the canonical value for cos/sin. With **transformers 5.1+** a runtime mismatch (14 vs 64) occurs in layer-streaming; use **transformers 5.0.x** for Qwen2/Qwen2.5 until a fix is available.
 - When using layer-streaming, the decoder may not fill the `DynamicCache` we pass; the engine then returns `past_key_values=None` and logs a warning once. Generation still works but each step re-runs the full forward (no incremental decoding), so throughput is lower. This is a known limitation with Qwen2 in 4.47+ under streaming; using a non-streaming run or a future fix will restore KV cache.
+
+### Fixes that apply to all models (base engine)
+
+- **`config.head_dim`**: If the config has `hidden_size` and `num_attention_heads`, the engine sets `config.head_dim = hidden_size // num_attention_heads` before creating the model so RoPE and attention use the correct dimension (avoids wrong values from hub or older configs).
+- **`get_sequence_len(seq)`**: Handles both 3D tensors `(batch, seq_len, hidden)` and 2D `(seq_len, hidden)` so the sequence length used for position embeddings is correct (avoids using `hidden_size` as length).
+- **`_reset_model()`**: After re-creating the model skeleton, the engine calls `set_layers_from_layer_names()` so `self.layers` always refers to the current model’s layers.
+- **`_fix_attention_head_dim()`**: For any model with `hidden_size` and `num_attention_heads`, the engine sets each decoder layer’s `self_attn.head_dim` to the canonical value. This is required when the config or transformers creates attention with a wrong `head_dim` (e.g. Qwen2.5-0.5B).
 
 ### Cache compatibility note
 

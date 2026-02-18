@@ -54,6 +54,19 @@ def resolve_attn_implementation(dtype, attn_implementation, is_flash_available_f
     return "sdpa"
 
 
+def _config_with_canonical_head_dim(config):
+    """Return a new config with head_dim = hidden_size // num_attention_heads (for Qwen2/5.2 RoPE)."""
+    if not hasattr(config, "hidden_size") or not hasattr(config, "num_attention_heads"):
+        return config
+    canonical = config.hidden_size // config.num_attention_heads
+    if getattr(config, "head_dim", None) == canonical:
+        return config
+    # New config from dict so the model is created with correct head_dim (transformers 5.2).
+    d = config.to_dict()
+    d["head_dim"] = canonical
+    return type(config)(**d)
+
+
 def create_model_from_config(config, attn_implementation, **extra_kwargs):
     """Create a meta model, suppressing noisy output from third-party model code (e.g. QWen).
 
@@ -75,6 +88,7 @@ def create_model_from_config(config, attn_implementation, **extra_kwargs):
     PreTrainedModel
         Model on meta device.
     """
+    config = _config_with_canonical_head_dim(config)
     devnull = io.StringIO()
     with (
         init_empty_weights(),

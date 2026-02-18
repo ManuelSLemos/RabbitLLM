@@ -67,6 +67,9 @@ class RabbitLLMBaseModel(GenerationMixin):
     set_layer_names_dict() for architecture-specific layer naming.
     """
 
+    # Required by transformers 5.x GenerationMixin for cache handling (supports DynamicCache).
+    _is_stateful = False
+
     def set_layer_names_dict(self):
         self.layer_names_dict = {
             "embed": "model.embed_tokens",
@@ -175,6 +178,20 @@ class RabbitLLMBaseModel(GenerationMixin):
         else:
             self.config = AutoConfig.from_pretrained(self.model_local_path, trust_remote_code=True)
 
+        # Set config.head_dim to canonical (hidden_size // num_attention_heads) so that
+        # Qwen2 and similar use the correct RoPE/attention dimension. Some configs omit
+        # head_dim or set it wrongly (e.g. to num_attention_heads).
+        if hasattr(self.config, "hidden_size") and hasattr(self.config, "num_attention_heads"):
+            canonical_hd = self.config.hidden_size // self.config.num_attention_heads
+            current_hd = getattr(self.config, "head_dim", None)
+            if current_hd != canonical_hd:
+                self.config.head_dim = canonical_hd
+                if current_hd is not None:
+                    logger.info(
+                        "Set config.head_dim from %s to canonical %s (hidden_size // num_attention_heads)",
+                        current_hd, canonical_hd,
+                    )
+
         # Resolve dtype: user-specified > model config > float16 fallback
         if dtype is None:
             config_dtype = getattr(self.config, "torch_dtype", None)
@@ -252,6 +269,12 @@ class RabbitLLMBaseModel(GenerationMixin):
     def init_model(self):
         self.model = None
 
+        # Ensure head_dim is canonical before creating the model (every time, including after _reset_model).
+        if hasattr(self.config, "hidden_size") and hasattr(self.config, "num_attention_heads"):
+            canonical_hd = self.config.hidden_size // self.config.num_attention_heads
+            if getattr(self.config, "head_dim", None) != canonical_hd:
+                self.config.head_dim = canonical_hd
+
         if hasattr(self, "_active_attn_implementation"):
             try:
                 self.model = create_model_from_config(
@@ -274,6 +297,25 @@ class RabbitLLMBaseModel(GenerationMixin):
             self._active_attn_implementation = "eager"
             logger.info("Model initialized with default (eager) attention")
 
+        # Sanity check for Qwen2-like models: decoder attention head_dim must be canonical
+        if hasattr(self.config, "hidden_size") and hasattr(self.config, "num_attention_heads"):
+            canonical_hd = self.config.hidden_size // self.config.num_attention_heads
+            model_attr = self.model
+            for attr_name in self.layer_names_dict.get("layer_prefix", "model.layers").split("."):
+                model_attr = getattr(model_attr, attr_name, None)
+                if model_attr is None:
+                    break
+            if model_attr is not None and len(model_attr) > 0:
+                first_attn = getattr(model_attr[0], "self_attn", None)
+                if first_attn is not None:
+                    layer_hd = getattr(first_attn, "head_dim", None)
+                    if layer_hd is not None and layer_hd != canonical_hd:
+                        # Force on the actual model modules so forward sees correct head_dim
+                        for layer in model_attr:
+                            attn = getattr(layer, "self_attn", None)
+                            if attn is not None:
+                                attn.head_dim = canonical_hd
+
         quantization_config = getattr(self.config, "quantization_config", None)
 
         if quantization_config is not None:
@@ -287,6 +329,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         # make lm_head.weight reference embed_tokens.weight (both on meta device), and
         # when embed_tokens is loaded, the tie breaks — leaving lm_head on meta.
 
+        self._fix_attention_head_dim()
         self.set_layers_from_layer_names()
 
         # Move buffers to device (not that much GPU memory used)
@@ -298,6 +341,28 @@ class RabbitLLMBaseModel(GenerationMixin):
         if "rotary_pos_emb" in self.layer_names_dict:
             # for glm keep rotary_pos_emb in gpu
             self.load_rotary_pos_emb_to_device()
+
+    def _fix_attention_head_dim(self):
+        """Force canonical head_dim on all decoder attention modules (e.g. Qwen2 14 vs 64)."""
+        if not hasattr(self.config, "hidden_size") or not hasattr(self.config, "num_attention_heads"):
+            return
+        canonical = self.config.hidden_size // self.config.num_attention_heads
+        model_attr = self.model
+        for attr_name in self.layer_names_dict["layer_prefix"].split("."):
+            model_attr = getattr(model_attr, attr_name)
+        for layer in model_attr:
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None and getattr(attn, "head_dim", None) != canonical:
+                attn.head_dim = canonical
+
+    def _fix_layer_attention_head_dim(self, layer):
+        """Force canonical head_dim on a single decoder layer's attention (e.g. after loading its weights)."""
+        if not hasattr(self.config, "hidden_size") or not hasattr(self.config, "num_attention_heads"):
+            return
+        canonical = self.config.hidden_size // self.config.num_attention_heads
+        attn = getattr(layer, "self_attn", None)
+        if attn is not None and getattr(attn, "head_dim", None) != canonical:
+            attn.head_dim = canonical
 
     def set_layers_from_layer_names(self):
 
@@ -398,10 +463,27 @@ class RabbitLLMBaseModel(GenerationMixin):
         return self.forward(*args, **kwargs)
 
     def get_past_key_values_cache_seq_len(self, past_key_values):
+        """Return cached sequence length; supports Cache objects (e.g. DynamicCache) and legacy tuple format."""
+        if cache_utils_installed and Cache is not None and isinstance(past_key_values, Cache):
+            return past_key_values.get_seq_length(0)
         return past_key_values[0][0].shape[2]
 
+    def _get_layer_past_kv(self, past_key_values, layer_idx):
+        """Return (k_cache, v_cache) for the given layer; supports Cache objects and legacy tuple format."""
+        if cache_utils_installed and Cache is not None and isinstance(past_key_values, Cache):
+            if layer_idx >= len(past_key_values):
+                return None, None
+            layer = past_key_values.layers[layer_idx]
+            if not getattr(layer, "is_initialized", True) or layer.keys.numel() == 0:
+                return None, None
+            return layer.keys, layer.values
+        return past_key_values[layer_idx][0], past_key_values[layer_idx][1]
+
     def get_sequence_len(self, seq):
-        return seq.shape[1]
+        """Return the sequence length (number of tokens). Handles (batch, seq_len, hidden) and (seq_len, hidden)."""
+        if seq.dim() == 2:
+            return seq.size(0)
+        return seq.size(1)
 
     @property
     def _uses_cache_objects(self):
@@ -455,7 +537,7 @@ class RabbitLLMBaseModel(GenerationMixin):
             return self.get_past_key_value_args(k_cache, v_cache)
         return {}
 
-    def get_pos_emb_args(self, len_p, len_s):
+    def get_pos_emb_args(self, len_p, len_s, layer=None):
         return {}
 
     def get_past_key_value_args(self, k_cache, v_cache):
@@ -480,6 +562,24 @@ class RabbitLLMBaseModel(GenerationMixin):
     def run_norm(self, layer, seq):
         return layer(seq)
 
+    def _get_model_rotary_emb(self):
+        """Return the model's rotary_emb module if present (e.g. Qwen2). Used to compute position_embeddings once per forward."""
+        if not hasattr(self.model, "model"):
+            return None
+        return getattr(self.model.model, "rotary_emb", None)
+
+    def _compute_position_embeddings_from_model(self, batch, position_ids):
+        """Compute (cos, sin) once using the model's rotary_emb. batch: list of tensors (B x (1,T,H)); position_ids: (1,T) or (B,T). Returns (cos, sin) or None."""
+        rotary = self._get_model_rotary_emb()
+        if rotary is None:
+            return None
+        stacked = torch.cat(batch, dim=0)
+        seq_len = stacked.size(1)
+        pos_slice = position_ids[:, :seq_len]
+        with torch.inference_mode():
+            cos, sin = rotary(stacked, pos_slice)
+        return (cos, sin)
+
     def _run_layer_streaming_loop(
         self,
         batch,
@@ -491,6 +591,8 @@ class RabbitLLMBaseModel(GenerationMixin):
         past_key_values,
     ):
         """Run the layer-by-layer streaming forward; returns (batch, kv_cache_list, all_hidden_states, all_self_attns)."""
+        self._fix_attention_head_dim()
+        self._position_embeddings_cache = None
         kv_cache_list = [] if use_cache else None
         if use_cache:
             for _ in self.layers:
@@ -571,8 +673,9 @@ class RabbitLLMBaseModel(GenerationMixin):
                         if output_hidden_states:
                             all_hidden_states[i].append(new_seq)
 
+                        self._fix_layer_attention_head_dim(layer)
                         if past_key_values is not None:
-                            k_cache, v_cache = past_key_values[i - 1]
+                            k_cache, v_cache = self._get_layer_past_kv(past_key_values, i - 1)
                             len_p = self.get_past_key_values_cache_seq_len(past_key_values)
                             len_s = self.get_sequence_len(seq)
                             position_ids_args = self.get_position_ids_args(
@@ -582,10 +685,15 @@ class RabbitLLMBaseModel(GenerationMixin):
                                 attention_mask, len_p, len_s
                             )
                             past_key_value_args = self._make_layer_past_kv_arg(k_cache, v_cache)
+                            pos_emb = (
+                                {"position_embeddings": self._position_embeddings_cache}
+                                if self._position_embeddings_cache is not None
+                                else self.get_pos_emb_args(len_p, len_s, layer=layer)
+                            )
                             kwargs = {
                                 "use_cache": True,
                                 **past_key_value_args,
-                                **self.get_pos_emb_args(len_p, len_s),
+                                **pos_emb,
                                 **attention_mask_args,
                                 **position_ids_args,
                             }
@@ -604,7 +712,11 @@ class RabbitLLMBaseModel(GenerationMixin):
                                     kv_cache_list[i][1].append(v_cache)
                         else:
                             len_seq = self.get_sequence_len(seq)
-                            pos_embed_args = self.get_pos_emb_args(0, len_seq)
+                            pos_embed_args = (
+                                {"position_embeddings": self._position_embeddings_cache}
+                                if self._position_embeddings_cache is not None
+                                else self.get_pos_emb_args(0, len_seq, layer=layer)
+                            )
                             attention_mask_args = self.get_attention_mask_args(
                                 attention_mask, 0, len_seq
                             )
@@ -653,6 +765,11 @@ class RabbitLLMBaseModel(GenerationMixin):
 
                         batch[j] = new_seq
 
+                if layer_name == self.layer_names_dict["embed"] and self._get_model_rotary_emb() is not None:
+                    self._position_embeddings_cache = self._compute_position_embeddings_from_model(
+                        batch, position_ids
+                    )
+
                 if output_hidden_states:
                     all_hidden_states += (torch.cat(batch, 0),)
 
@@ -676,6 +793,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         del self.model
         clean_memory()
         self.init_model()
+        self.set_layers_from_layer_names()
 
     def _prepare_batch(self, input_ids):
         """Move input_ids to running device and shape as list of single-sequence tensors."""
