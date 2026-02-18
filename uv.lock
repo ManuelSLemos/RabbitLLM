@@ -1016,6 +1016,7 @@ version = "2.11.0"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
+    { name = "bitsandbytes" },
     { name = "einops" },
     { name = "huggingface-hub" },
     { name = "safetensors" },
@@ -1042,9 +1043,15 @@ flash = [
     { name = "flash-attn" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=0.26" },
+    { name = "bitsandbytes", specifier = ">=0.49.2" },
     { name = "bitsandbytes", marker = "extra == 'compression'" },
     { name = "einops", specifier = ">=0.8.2" },
     { name = "flash-attn", marker = "extra == 'flash'", specifier = ">=2.5" },
@@ -1062,6 +1069,9 @@ requires-dist = [
     { name = "transformers-stream-generator", specifier = ">=0.0.5" },
 ]
 provides-extras = ["compression", "flash", "server", "dev"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.0.2" }]
 
 [[package]]
 name = "regex"

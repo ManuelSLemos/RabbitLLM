@@ -43,7 +43,11 @@ The central idea is processing models **one layer at a time** to fit within cons
 
 ### Key Classes
 
-**`RabbitLLMBaseModel`** (`src/rabbitllm/engine/base.py`) — Base class implementing the layer-streaming forward pass, inheriting `GenerationMixin` for text generation. All model variants extend this.
+**`RabbitLLMBaseModel`** (`src/rabbitllm/engine/base.py`) — Base class implementing the layer-streaming forward pass, inheriting `GenerationMixin` for text generation. All model variants extend this. The engine package is split into focused modules used by the base class:
+- **`engine/attention.py`** — Attention implementation resolution and meta model creation (`resolve_attn_implementation`, `create_model_from_config`, `ATTN_FALLBACK_ORDER`).
+- **`engine/model_init.py`** — Model skeleton creation with attention fallback (`create_model_with_attn_fallback`).
+- **`engine/layer_loading.py`** — Loading layer state dicts from disk and moving them to device (`load_layer_to_cpu`, `move_layer_to_device`).
+- **`engine/forward_utils.py`** — Helpers for the forward pass (attention mask/position_ids construction, KV extraction from layer outputs).
 
 **`AutoModel`** (`src/rabbitllm/models/registry.py`) — Factory that reads HuggingFace config `architectures` to select the right model class. On macOS, always returns the MLX implementation.
 

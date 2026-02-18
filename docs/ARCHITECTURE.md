@@ -68,6 +68,8 @@ The base `_make_layer_past_kv_arg()` currently always returns `past_key_value` w
 
 ## Layer-streaming forward loop
 
+The logic is split across `src/rabbitllm/engine/`: `base.py` holds `RabbitLLMBaseModel` and the main `forward()` / `_run_layer_streaming_loop()`; `attention.py` and `model_init.py` handle model creation and attention fallback; `layer_loading.py` handles loading and moving layer weights; `forward_utils.py` handles attention mask/position_ids and KV extraction from layer outputs.
+
 1. Recreate the model skeleton (`init_model()`).
 2. For each layer name in order (embed → layers → norm → lm_head):
    - Load that layer’s state_dict from disk (and for tied lm_head with empty split, load embed and assign to lm_head).

@@ -4,7 +4,14 @@ import torch
 
 from rabbitllm import compress_layer_state_dict, uncompress_layer_state_dict
 
+try:
+    import bitsandbytes  # noqa: F401
+    _BITSANDBYTES_AVAILABLE = True
+except ImportError:
+    _BITSANDBYTES_AVAILABLE = False
 
+
+@unittest.skipUnless(_BITSANDBYTES_AVAILABLE, "bitsandbytes not installed; install with: pip install bitsandbytes")
 class TestCompression(unittest.TestCase):
     def setUp(self):
         pass

@@ -1,30 +1,31 @@
 import contextlib
-import io
 import logging
-import os
 import time
 import warnings
 import torch
 
 from typing import List, Optional, Tuple, Union
 from tqdm import tqdm
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoModel, GenerationMixin, LlamaForCausalLM, GenerationConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationMixin, GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from accelerate import init_empty_weights
 from accelerate.utils.modeling import set_module_tensor_to_device
-from transformers.quantizers import AutoHfQuantizer, HfQuantizer
+from transformers.quantizers import AutoHfQuantizer
 
 from ..profiler import LayeredProfiler
-
-from ..utils import clean_memory, load_layer, \
-    find_or_create_local_splitted_path, is_flash_attention_available
+from ..utils import clean_memory, load_layer, find_or_create_local_splitted_path, is_flash_attention_available
+from .attention import ATTN_FALLBACK_ORDER, resolve_attn_implementation, create_model_from_config
+from .model_init import create_model_with_attn_fallback
+from . import layer_loading as layer_loading_impl
+from .forward_utils import (
+    build_attention_mask_and_position_ids,
+    extract_kv_from_layer_output as extract_kv_from_layer_output_fn,
+)
 
 logger = logging.getLogger(__name__)
 
 try:
-    import bitsandbytes as bnb
+    import bitsandbytes as bnb  # noqa: F401
 
     bitsandbytes_installed = True
     logger.info("bitsandbytes installed")
@@ -38,13 +39,8 @@ try:
     logger.info("cache_utils installed")
 except ImportError:
     cache_utils_installed = False
-
-
-ATTN_FALLBACK_ORDER = {
-    "flash_attention_2": ["flash_attention_2", "sdpa", "eager"],
-    "sdpa": ["sdpa", "eager"],
-    "eager": ["eager"],
-}
+    Cache = None
+    DynamicCache = None
 
 
 class RabbitLLMBaseModel(GenerationMixin):
@@ -215,57 +211,19 @@ class RabbitLLMBaseModel(GenerationMixin):
 
     def _resolve_attn_implementation(self):
         """Resolve the best attention implementation to use."""
-        if self.attn_implementation != "auto":
-            return self.attn_implementation
-
-        # FlashAttention 2 requires fp16 or bf16
-        if self.running_dtype not in (torch.float16, torch.bfloat16):
-            logger.info(
-                "dtype %s is not compatible with FlashAttention 2 (requires fp16/bf16). Using SDPA.",
-                self.running_dtype,
-            )
-            return "sdpa"
-
-        flash_ok, flash_msg = is_flash_attention_available()
-        if flash_ok:
-            logger.info(flash_msg)
-            return "flash_attention_2"
-
-        logger.info("FlashAttention not available: %s. Using SDPA.", flash_msg)
-        return "sdpa"
-
-    def _create_model_from_config(self, **extra_kwargs):
-        """Create a meta model, suppressing noisy output from third-party model code (e.g. QWen).
-
-        Some model implementations (notably QWen v1) emit flash-attn import warnings
-        via print(), logging, and warnings on every instantiation. We suppress all three
-        channels during model creation to keep output clean.
-        """
-        devnull = io.StringIO()
-        with init_empty_weights(), \
-             contextlib.redirect_stdout(devnull), \
-             contextlib.redirect_stderr(devnull), \
-             warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            # Temporarily raise the logging level for all loggers to suppress
-            # noisy INFO/WARNING messages from third-party model code.
-            root_logger = logging.getLogger()
-            prev_level = root_logger.level
-            root_logger.setLevel(logging.ERROR)
-            try:
-                return AutoModelForCausalLM.from_config(
-                    self.config, trust_remote_code=True, **extra_kwargs
-                )
-            finally:
-                root_logger.setLevel(prev_level)
+        return resolve_attn_implementation(
+            self.running_dtype,
+            self.attn_implementation,
+            is_flash_attention_available,
+        )
 
     def init_model(self):
         self.model = None
 
-        # On the first call we discover which attn impl works; after that reuse it directly.
         if hasattr(self, "_active_attn_implementation"):
             try:
-                self.model = self._create_model_from_config(
+                self.model = create_model_from_config(
+                    self.config,
                     attn_implementation=self._active_attn_implementation,
                 )
             except (ValueError, TypeError):
@@ -274,22 +232,15 @@ class RabbitLLMBaseModel(GenerationMixin):
         if self.model is None:
             resolved_attn = self._resolve_attn_implementation()
             fallback_chain = ATTN_FALLBACK_ORDER.get(resolved_attn, ["sdpa", "eager"])
-
-            for impl in fallback_chain:
-                try:
-                    self.model = self._create_model_from_config(attn_implementation=impl)
-                    self._active_attn_implementation = impl
-                    logger.info("Model initialized with attn_implementation='%s'", impl)
-                    break
-                except (ValueError, TypeError) as e:
-                    logger.info("attn_implementation='%s' not supported for this model, trying next.", impl)
-                    if self.model is not None:
-                        del self.model
-                    clean_memory()
-                    self.model = None
+            create_fn = lambda impl: create_model_from_config(
+                self.config, attn_implementation=impl
+            )
+            self.model, self._active_attn_implementation = create_model_with_attn_fallback(
+                fallback_chain, create_fn, clean_memory
+            )
 
         if self.model is None:
-            self.model = self._create_model_from_config(attn_implementation="eager")
+            self.model = create_model_from_config(self.config, attn_implementation="eager")
             self._active_attn_implementation = "eager"
             logger.info("Model initialized with default (eager) attention")
 
@@ -347,59 +298,22 @@ class RabbitLLMBaseModel(GenerationMixin):
         self.move_layer_to_device(state_dict)
 
     def load_layer_to_cpu(self, layer_name):
-        t = time.time()
-
-        load_layer_output = load_layer(self.checkpoint_path, layer_name, self.profiling_mode)
-        elapsed_time = time.time() - t
-
-        if self.profiling_mode:
-            state_dict, compression_time = load_layer_output
-            disk_loading_time = elapsed_time - compression_time
-
-            self.profiler.add_profiling_time('load_safe_tensor', disk_loading_time)
-
-            self.profiler.add_profiling_time('compression_time', compression_time)
-        else:
-            state_dict = load_layer_output
-
-        # pin memory:
-        if self.prefetching:
-            t = time.time()
-            if torch.cuda.is_available():  # Check if CUDA is available
-                for k in state_dict.keys():
-                    state_dict[k].pin_memory()
-            else:
-                # For CPU, no action is needed, but you could optionally add a log or message
-                logger.debug("Prefetching is enabled, but no pin_memory operation is needed for CPU.")
-
-            elapsed_time = time.time() - t
-            if self.profiling_mode:
-                self.profiler.add_profiling_time('pin_memory_to_trigger_load', elapsed_time)
-
-        return state_dict
+        return layer_loading_impl.load_layer_to_cpu(
+            self.checkpoint_path,
+            layer_name,
+            self.profiling_mode,
+            self.prefetching,
+            self.profiler if self.profiling_mode else None,
+        )
 
     def move_layer_to_device(self, state_dict):
-        layers = []
-        for param_name, param in state_dict.items():
-            if self.hf_quantizer is None:
-                layers.append(param_name)
-            else:
-                if '.weight' in param_name:
-                    layer_name = param_name[:param_name.index(".weight") + len(".weight")]
-                    if layer_name not in layers:
-                        layers.append(layer_name)
-
-        for param_name in layers:
-            if (self.hf_quantizer is None or
-                not self.hf_quantizer.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
-               ):
-                set_module_tensor_to_device(self.model, param_name, self.running_device, value=state_dict[param_name],
-                                            dtype=self.running_dtype,
-                                            )
-            else:
-                torch_dtype = self.hf_quantizer.update_torch_dtype(None)
-                self.hf_quantizer.create_quantized_param(self.model, state_dict[param_name], param_name, self.running_device, state_dict)
-        return layers
+        return layer_loading_impl.move_layer_to_device(
+            self.model,
+            state_dict,
+            self.running_device,
+            self.running_dtype,
+            self.hf_quantizer,
+        )
 
     # make GenerationMixin happy
     def can_generate(self):
@@ -484,32 +398,13 @@ class RabbitLLMBaseModel(GenerationMixin):
                 attn.layer_idx = original_idx
 
     def _extract_kv_from_layer_output(self, layer_out, output_attentions=False):
-        """Extract (hidden_states, k_cache, v_cache) from a decoder layer output.
-
-        Handles both legacy tuple format (eager) and Cache objects (SDPA/FA2).
-        In 4.47+, some layers (e.g. Qwen2) return only a tensor; caller may get
-        KV from the DynamicCache passed in kwargs.
-        """
-        if isinstance(layer_out, torch.Tensor):
-            return layer_out, None, None
-        hidden_states = layer_out[0]
-        cache_idx = 2 if output_attentions else 1
-        cache_data = layer_out[cache_idx] if len(layer_out) > cache_idx else None
-
-        if cache_data is None:
-            return hidden_states, None, None
-
-        # Legacy tuple format: (key_states, value_states)
-        if isinstance(cache_data, tuple):
-            return hidden_states, cache_data[0], cache_data[1]
-
-        # DynamicCache or similar Cache object
-        if cache_utils_installed and isinstance(cache_data, Cache):
-            if len(cache_data.key_cache) > 0:
-                return hidden_states, cache_data.key_cache[-1], cache_data.value_cache[-1]
-            return hidden_states, None, None
-
-        return hidden_states, None, None
+        """Extract (hidden_states, k_cache, v_cache) from a decoder layer output."""
+        return extract_kv_from_layer_output_fn(
+            layer_out,
+            output_attentions=output_attentions,
+            cache_utils_installed=cache_utils_installed,
+            cache_class=Cache,
+        )
 
     def _make_layer_past_kv_arg(self, k_cache=None, v_cache=None):
         """Build the past_key_value argument appropriate for the attention implementation."""
@@ -549,6 +444,219 @@ class RabbitLLMBaseModel(GenerationMixin):
     def run_norm(self, layer, seq):
         return layer(seq)
 
+    def _run_layer_streaming_loop(
+        self,
+        batch,
+        attention_mask,
+        position_ids,
+        use_cache,
+        output_attentions,
+        output_hidden_states,
+        past_key_values,
+    ):
+        """Run the layer-by-layer streaming forward; returns (batch, kv_cache_list, all_hidden_states, all_self_attns)."""
+        kv_cache_list = [] if use_cache else None
+        if use_cache:
+            for _ in self.layers:
+                kv_cache_list.append(([], []))
+        all_hidden_states = [] * len(self.layers) if output_hidden_states else None
+        all_self_attns = [] * len(self.layers) if output_attentions else None
+
+        with torch.inference_mode(), ThreadPoolExecutor() as executor:
+            if self.prefetching:
+                future = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
+
+            for i, (layer_name, layer) in tqdm(
+                enumerate(zip(self.layer_names, self.layers)),
+                desc=f"running layers({self.running_device})",
+                total=len(self.layers),
+            ):
+                if self.prefetching:
+                    if self.profiling_mode:
+                        t = time.time()
+                    state_dict = future.result()
+                    if self.profiling_mode:
+                        self.profiler.add_profiling_time(
+                            "load_safe_tensor_cpu_wait", time.time() - t
+                        )
+                    if self.profiling_mode:
+                        t = time.time()
+                    moved_layers = self.move_layer_to_device(state_dict)
+                    if self.profiling_mode:
+                        self.profiler.add_profiling_time(
+                            "create_layer_from_state_dict", time.time() - t
+                        )
+                    if (i + 1) < len(self.layer_names):
+                        if self.profiling_mode:
+                            t = time.time()
+                        future = executor.submit(
+                            self.load_layer_to_cpu, self.layer_names[i + 1]
+                        )
+                        if self.profiling_mode:
+                            self.profiler.add_profiling_time(
+                                "kick_off_load_cpu", time.time() - t
+                            )
+                else:
+                    state_dict = self.load_layer_to_cpu(layer_name)
+                    if self.profiling_mode:
+                        t = time.time()
+                    moved_layers = self.move_layer_to_device(state_dict)
+                    if self.profiling_mode:
+                        self.profiler.add_profiling_time(
+                            "create_layer_from_safe_tensor", time.time() - t
+                        )
+
+                if (
+                    layer_name == self.layer_names_dict["lm_head"]
+                    and len(state_dict) == 0
+                    and getattr(self.config, "tie_word_embeddings", False)
+                ):
+                    embed_state_dict = self.load_layer_to_cpu(
+                        self.layer_names_dict["embed"]
+                    )
+                    embed_key = self.layer_names_dict["embed"] + ".weight"
+                    lm_head_key = self.layer_names_dict["lm_head"] + ".weight"
+                    if embed_key in embed_state_dict:
+                        set_module_tensor_to_device(
+                            self.model,
+                            lm_head_key,
+                            self.running_device,
+                            value=embed_state_dict[embed_key],
+                            dtype=self.running_dtype,
+                        )
+
+                if self.profiling_mode:
+                    _forward_layer_start = time.time()
+
+                for j, seq in enumerate(batch):
+                    if layer_name == self.layer_names_dict["embed"]:
+                        batch[j] = layer(seq)
+                    elif layer_name == self.layer_names_dict["norm"]:
+                        batch[j] = self.run_norm(layer, seq)
+                        if output_hidden_states:
+                            all_hidden_states[i].append(batch[j])
+                    elif layer_name == self.layer_names_dict["lm_head"]:
+                        batch[j] = self.run_lm_head(layer, seq)
+                    else:
+                        if output_hidden_states:
+                            all_hidden_states[i].append(new_seq)
+
+                        if past_key_values is not None:
+                            k_cache, v_cache = past_key_values[i - 1]
+                            len_p = self.get_past_key_values_cache_seq_len(
+                                past_key_values
+                            )
+                            len_s = self.get_sequence_len(seq)
+                            position_ids_args = self.get_position_ids_args(
+                                position_ids, len_p, len_s
+                            )
+                            attention_mask_args = self.get_attention_mask_args(
+                                attention_mask, len_p, len_s
+                            )
+                            past_key_value_args = self._make_layer_past_kv_arg(
+                                k_cache, v_cache
+                            )
+                            kwargs = {
+                                "use_cache": True,
+                                **past_key_value_args,
+                                **self.get_pos_emb_args(len_p, len_s),
+                                **attention_mask_args,
+                                **position_ids_args,
+                            }
+                            with self._layer_idx_as_zero(layer):
+                                layer_outputs = layer(seq, **kwargs)
+                            new_seq = layer_outputs[0]
+                            if output_attentions:
+                                all_self_attns[i].append(layer_outputs[1])
+                            if use_cache:
+                                _, k_cache, v_cache = self._extract_kv_from_layer_output(
+                                    layer_outputs,
+                                    output_attentions=output_attentions,
+                                )
+                                if k_cache is not None:
+                                    kv_cache_list[i][0].append(k_cache)
+                                    kv_cache_list[i][1].append(v_cache)
+                        else:
+                            len_seq = self.get_sequence_len(seq)
+                            pos_embed_args = self.get_pos_emb_args(0, len_seq)
+                            attention_mask_args = self.get_attention_mask_args(
+                                attention_mask, 0, len_seq
+                            )
+                            position_ids_args = self.get_position_ids_args(
+                                position_ids, 0, len_seq
+                            )
+                            if not use_cache:
+                                kwargs = {
+                                    "use_cache": False,
+                                    **pos_embed_args,
+                                    **attention_mask_args,
+                                    **position_ids_args,
+                                }
+                                new_seq = layer(seq, **kwargs)[0]
+                            else:
+                                past_kv_args = self._make_layer_past_kv_arg()
+                                pos_slice = position_ids[:, 0:len_seq]
+                                kwargs = {
+                                    "use_cache": True,
+                                    "cache_position": pos_slice,
+                                    **past_kv_args,
+                                    **pos_embed_args,
+                                    **attention_mask_args,
+                                    **position_ids_args,
+                                }
+                                with self._layer_idx_as_zero(layer):
+                                    layer_out = layer(seq, **kwargs)
+                                new_seq, k_cache, v_cache = self._extract_kv_from_layer_output(
+                                    layer_out
+                                )
+                                if (
+                                    k_cache is None
+                                    and cache_utils_installed
+                                    and self._uses_cache_objects
+                                ):
+                                    pkv = kwargs.get(
+                                        "past_key_value"
+                                    ) or kwargs.get("past_key_values")
+                                    if isinstance(pkv, Cache):
+                                        key_cache = getattr(
+                                            pkv, "key_cache", None
+                                        )
+                                        value_cache = getattr(
+                                            pkv, "value_cache", None
+                                        )
+                                        if (
+                                            key_cache
+                                            and value_cache
+                                            and len(key_cache) > 0
+                                        ):
+                                            k_cache = key_cache[-1]
+                                            v_cache = value_cache[-1]
+                                if k_cache is not None:
+                                    kv_cache_list[i][0].append(k_cache)
+                                    kv_cache_list[i][1].append(v_cache)
+
+                        batch[j] = new_seq
+
+                if output_hidden_states:
+                    all_hidden_states += (torch.cat(batch, 0),)
+
+                if self.hf_quantizer is not None:
+                    for param_name in moved_layers:
+                        set_module_tensor_to_device(
+                            self.model, param_name, "meta"
+                        )
+                else:
+                    layer.to("meta")
+                layer.to("meta")
+                clean_memory()
+                if self.profiling_mode:
+                    self.profiler.add_profiling_time(
+                        "forward_per_layer",
+                        time.time() - _forward_layer_start,
+                    )
+
+        return batch, kv_cache_list, all_hidden_states, all_self_attns
+
     def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -566,224 +674,33 @@ class RabbitLLMBaseModel(GenerationMixin):
 
         if self.profiling_mode:
             self.profiler.clear_profiling_time()
-
             forward_start = time.process_time()
             forward_start_wall = time.time()
 
-        # Reboot the model to make sure buffers are loaded and memory is clean
         del self.model
         clean_memory()
         self.init_model()
 
-        batch = [input_ids_unit.to(self.running_device).unsqueeze(0) for input_ids_unit in input_ids]
-        n_seq = len(batch[0])
+        batch = [
+            input_ids_unit.to(self.running_device).unsqueeze(0)
+            for input_ids_unit in input_ids
+        ]
+        attention_mask, position_ids = build_attention_mask_and_position_ids(
+            self.running_device,
+            self.running_dtype,
+            self.max_seq_len,
+            self._active_attn_implementation,
+        )
 
-        # Create attention mask for the largest input, and position ids to use KV cache.
-        # - FlashAttention 2: expects a 2D mask (batch, seq_len), handles causality internally.
-        # - SDPA: handles causality natively (is_causal=True) when mask is None, so no mask needed.
-        # - Eager: requires a 4D causal mask.
-        if self._active_attn_implementation == "flash_attention_2":
-            attention_mask = torch.ones(1, self.max_seq_len, dtype=torch.long, device=self.running_device)
-        elif self._active_attn_implementation == "sdpa":
-            attention_mask = None
-        else:
-            # Eager attention uses additive masking: 0.0 = attend, large negative = ignore.
-            attention_mask = torch.full(
-                (self.max_seq_len, self.max_seq_len),
-                torch.finfo(self.running_dtype).min,
-                dtype=self.running_dtype,
-                device=self.running_device,
-            )
-            attention_mask = torch.triu(attention_mask, diagonal=1)[None, None, ...]
-        position_ids = torch.arange(self.max_seq_len, dtype=torch.long, device=self.running_device)[None, :]
-
-        kv_cache_list = [] if use_cache else None
-        if use_cache:
-            for x in self.layers:
-                kv_cache_list.append(([], []))
-        all_hidden_states = [] * len(self.layers) if output_hidden_states else None
-        all_self_attns = [] * len(self.layers) if output_attentions else None
-
-        with torch.inference_mode(), ThreadPoolExecutor() as executor:
-
-            # Load first layer
-            if self.prefetching:
-                #with torch.cuda.stream(self.stream):
-                #state_dict = self.load_layer_to_cpu(self.layer_names[0])
-                future = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
-
-
-            for i, (layer_name, layer) in tqdm(enumerate(zip(self.layer_names, self.layers)),
-                                               desc=f'running layers({self.running_device})',
-                                               total=len(self.layers)):
-
-                if self.prefetching:
-                    if self.profiling_mode:
-                        t = time.time()
-                    # Load current layer and prepare next layer
-                    state_dict = future.result()
-                    #torch.cuda.current_stream().wait_stream(self.stream)
-                    if self.profiling_mode:
-                        elapsed_time = time.time() - t
-                        self.profiler.add_profiling_time('load_safe_tensor_cpu_wait', elapsed_time)
-
-                    #for param_name, param in state_dict.items():
-                    #    state_dict[param_name] = param.to('cuda', non_blocking=True)
-
-                    if self.profiling_mode:
-                        t = time.time()
-                    moved_layers = self.move_layer_to_device(state_dict)
-                    if self.profiling_mode:
-                        elapsed_time = time.time() - t
-                        self.profiler.add_profiling_time('create_layer_from_state_dict', elapsed_time)
-
-                    # kick off next layer loading
-
-                    if (i + 1) < len(self.layer_names):
-                        #with torch.cuda.stream(self.stream):
-                        #state_dict = self.load_layer_to_cpu(self.layer_names[i + 1])
-                        if self.profiling_mode:
-                            t = time.time()
-                        future = executor.submit(self.load_layer_to_cpu, self.layer_names[i+1])
-                        #for param_name, param in state_dict.items():
-                        #    state_dict[param_name] = param.to('cuda', non_blocking=True)
-
-                        if self.profiling_mode:
-                            elapsed_time = time.time() - t
-                            self.profiler.add_profiling_time('kick_off_load_cpu', elapsed_time)
-
-                else:
-                    state_dict = self.load_layer_to_cpu(layer_name)
-                    if self.profiling_mode:
-                        t = time.time()
-                    moved_layers = self.move_layer_to_device(state_dict)
-                    if self.profiling_mode:
-                        elapsed_time = time.time() - t
-                        self.profiler.add_profiling_time('create_layer_from_safe_tensor', elapsed_time)
-
-                # Handle tied weights: if lm_head split was empty (tie_word_embeddings),
-                # load the embedding weight as the lm_head weight.
-                if (layer_name == self.layer_names_dict['lm_head']
-                        and len(state_dict) == 0
-                        and getattr(self.config, 'tie_word_embeddings', False)):
-                    embed_state_dict = self.load_layer_to_cpu(self.layer_names_dict['embed'])
-                    embed_key = self.layer_names_dict['embed'] + '.weight'
-                    lm_head_key = self.layer_names_dict['lm_head'] + '.weight'
-                    if embed_key in embed_state_dict:
-                        set_module_tensor_to_device(
-                            self.model, lm_head_key, self.running_device,
-                            value=embed_state_dict[embed_key], dtype=self.running_dtype)
-
-                # Run layer
-                if self.profiling_mode:
-                    _forward_layer_start = time.time()
-
-                for j, seq in enumerate(batch):
-
-                    if layer_name == self.layer_names_dict['embed']:
-                        batch[j] = layer(seq)
-                    elif layer_name == self.layer_names_dict['norm']:
-                        #batch[j] = layer(seq[torch.arange(n_seq), batch_eos[j]][:, None])
-                        batch[j] = self.run_norm(layer, seq)
-
-                        if output_attentions:
-                            all_hidden_states[i].append(batch[j])
-                    elif layer_name == self.layer_names_dict['lm_head']:
-                        batch[j] = self.run_lm_head(layer, seq)
-                    else:
-
-                        if output_attentions:
-                            all_hidden_states[i].append(new_seq)
-
-                        if past_key_values is not None:
-                            # join past kv
-                            k_cache, v_cache = past_key_values[i - 1]
-                            len_p = self.get_past_key_values_cache_seq_len(past_key_values)
-                            len_s = self.get_sequence_len(seq)
-
-                            position_ids_args = self.get_position_ids_args(position_ids, len_p, len_s)
-                            attention_mask_args = self.get_attention_mask_args(attention_mask, len_p, len_s)
-                            past_key_value_args = self._make_layer_past_kv_arg(k_cache, v_cache)
-
-                            kwargs = {'use_cache': True}
-
-                            pos_embed_args = self.get_pos_emb_args(len_p, len_s)
-                            kwargs = {**kwargs, **past_key_value_args, **pos_embed_args, **attention_mask_args,
-                                      **position_ids_args}
-
-                            with self._layer_idx_as_zero(layer):
-                                layer_outputs = layer(seq, **kwargs)
-                            new_seq = layer_outputs[0]
-
-                            if output_attentions:
-                                all_self_attns[i].append(layer_outputs[1])
-
-                            if use_cache:
-                                _, k_cache, v_cache = self._extract_kv_from_layer_output(
-                                    layer_outputs, output_attentions=output_attentions)
-                                if k_cache is not None:
-                                    kv_cache_list[i][0].append(k_cache)
-                                    kv_cache_list[i][1].append(v_cache)
-
-                        else:
-                            len_seq = self.get_sequence_len(seq)
-
-                            pos_embed_args = self.get_pos_emb_args(0, len_seq)
-                            attention_mask_args = self.get_attention_mask_args(attention_mask, 0, len_seq)
-                            position_ids_args = self.get_position_ids_args(position_ids, 0, len_seq)
-
-                            if not use_cache:
-                                kwargs = {'use_cache': False}
-                                kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
-                                new_seq = layer(seq, **kwargs)[0]
-                            else:
-                                past_kv_args = self._make_layer_past_kv_arg()
-                                # Qwen2 and other 4.47+ models need cache_position to update DynamicCache
-                                pos_slice = position_ids[:, 0:len_seq]
-                                kwargs = {
-                                    'use_cache': True,
-                                    'cache_position': pos_slice,
-                                    **past_kv_args,
-                                    **pos_embed_args,
-                                    **attention_mask_args,
-                                    **position_ids_args,
-                                }
-
-                                with self._layer_idx_as_zero(layer):
-                                    layer_out = layer(seq, **kwargs)
-                                # In 4.47+, some layers (e.g. Qwen2) return only hidden_states and update
-                                # the DynamicCache in-place; extract KV from the cache we passed in.
-                                new_seq, k_cache, v_cache = self._extract_kv_from_layer_output(layer_out)
-                                if k_cache is None and cache_utils_installed and self._uses_cache_objects:
-                                    pkv = kwargs.get("past_key_value") or kwargs.get("past_key_values")
-                                    if isinstance(pkv, Cache):
-                                        key_cache = getattr(pkv, "key_cache", None)
-                                        value_cache = getattr(pkv, "value_cache", None)
-                                        if key_cache and value_cache and len(key_cache) > 0:
-                                            k_cache = key_cache[-1]
-                                            v_cache = value_cache[-1]
-                                if k_cache is not None:
-                                    kv_cache_list[i][0].append(k_cache)
-                                    kv_cache_list[i][1].append(v_cache)
-
-                        batch[j] = new_seq
-
-                if output_hidden_states:
-                    all_hidden_states += (torch.cat(batch, 0),)
-
-                # Remove previous layer from memory (including buffers)
-
-                if self.hf_quantizer is not None:
-                    for param_name in moved_layers:#param_name, param in state_dict.items():
-                        set_module_tensor_to_device(self.model, param_name,'meta')
-                else:
-                    layer.to("meta")
-
-                layer.to("meta")
-                clean_memory()  # proposed by CPMP
-
-                if self.profiling_mode:
-                    self.profiler.add_profiling_time('forward_per_layer', time.time() - _forward_layer_start)
+        batch, kv_cache_list, all_hidden_states, all_self_attns = self._run_layer_streaming_loop(
+            batch,
+            attention_mask,
+            position_ids,
+            use_cache,
+            output_attentions,
+            output_hidden_states,
+            past_key_values,
+        )
 
         logits = torch.cat(batch, 0)
         if use_cache:
