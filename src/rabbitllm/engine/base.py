@@ -12,9 +12,12 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
-    GenerationMixin,
     GenerationConfig,
 )
+try:
+    from transformers import GenerationMixin
+except ImportError:
+    from transformers.generation.utils import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from accelerate.utils.modeling import set_module_tensor_to_device
 from transformers.quantizers import AutoHfQuantizer

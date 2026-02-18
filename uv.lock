@@ -1199,7 +1199,7 @@ requires-dist = [
     { name = "tiktoken", specifier = ">=0.12.0" },
     { name = "torch", specifier = ">=2.0" },
     { name = "tqdm" },
-    { name = "transformers", specifier = ">=4.47,<4.49" },
+    { name = "transformers", specifier = ">=4.47,<4.57" },
     { name = "transformers-stream-generator", specifier = ">=0.0.5" },
 ]
 provides-extras = ["compression", "flash", "server", "dev"]

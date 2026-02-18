@@ -50,25 +50,32 @@ class AutoModel:
                 pretrained_model_name_or_path, trust_remote_code=True
             )
 
-        if "Qwen2ForCausalLM" in config.architectures[0]:
+        arch = config.architectures[0]
+        if "Qwen2ForCausalLM" in arch or "Qwen2.5" in arch:
             return "rabbitllm.models.qwen2", "RabbitLLMQWen2"
-        elif "QWen" in config.architectures[0]:
+        if "Qwen3" in arch:
+            return "rabbitllm.models.qwen2", "RabbitLLMQWen2"
+        if "QWen" in arch:
             return "rabbitllm.models.qwen", "RabbitLLMQWen"
-        elif "Baichuan" in config.architectures[0]:
+        if "Baichuan" in arch:
             return "rabbitllm.models.baichuan", "RabbitLLMBaichuan"
-        elif "ChatGLM" in config.architectures[0]:
+        if "ChatGLM" in arch:
             return "rabbitllm.models.chatglm", "RabbitLLMChatGLM"
-        elif "InternLM" in config.architectures[0]:
+        if "InternLM" in arch:
             return "rabbitllm.models.internlm", "RabbitLLMInternLM"
-        elif "Mistral" in config.architectures[0]:
+        if "Mistral" in arch and "Mixtral" not in arch:
             return "rabbitllm.models.mistral", "RabbitLLMMistral"
-        elif "Mixtral" in config.architectures[0]:
+        if "Mixtral" in arch:
             return "rabbitllm.models.mixtral", "RabbitLLMMixtral"
-        elif "Llama" in config.architectures[0]:
+        if "Gemma" in arch or "Phi2" in arch or "Phi3" in arch or "Phi4" in arch:
+            return "rabbitllm.models.llama", "RabbitLLMLlama2"
+        if "DeepSeek" in arch:
+            return "rabbitllm.models.llama", "RabbitLLMLlama2"
+        if "Llama" in arch:
             return "rabbitllm.models.llama", "RabbitLLMLlama2"
         else:
             logger.warning(
-                "unknown architecture: %s, try to use Llama2...", config.architectures[0]
+                "unknown architecture: %s, try to use Llama2...", arch
             )
             return "rabbitllm.models.llama", "RabbitLLMLlama2"
 

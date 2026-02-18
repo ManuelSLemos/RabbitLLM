@@ -120,23 +120,126 @@ New test files: `test_model_registry.py`, `test_compression.py`, `test_platform.
 
 ---
 
-## Phase 3: New Features — CLI + API Server
+## Phase 2.5: Model compatibility (dependencias + registro)
 
-### 3.1 CLI with Typer (`src/rabbitllm/cli.py`)
+*Antes de seguir con planner/tools: actualizar librerías y ampliar el registro para poder ejecutar modelos actuales (Qwen3, Gemma, DeepSeek, Phi, Llama 3.2, etc.).*
+
+### 2.5.1 Actualizar dependencias
+
+- **transformers**: ampliar rango soportado (ej. `>=4.47,<4.57` o superior) para poder usar 4.50–4.56 y más modelos recientes.
+- Ajustar import de `GenerationMixin` si en versiones nuevas pasa a `transformers.generation.utils`.
+- **accelerate**, **safetensors**, **huggingface-hub**: revisar versiones mínimas recomendadas.
+
+### 2.5.2 Ampliar registro de arquitecturas
+
+En `models/registry.py`, añadir ramas para arquitecturas recientes (mapeando a clases existentes cuando la estructura sea compatible):
+
+- **Qwen3** → `RabbitLLMQWen2` (o módulo qwen2 si la API es compatible).
+- **Gemma2 / Gemma3** → Llama-like (`RabbitLLMLlama2`).
+- **DeepSeekV2 / DeepSeekV3** → Llama-like.
+- **Phi2 / Phi3** → Llama-like.
+- **Llama3_2** y variantes → `RabbitLLMLlama2`.
+
+Comprobar en la documentación de transformers los nombres exactos de `config.architectures` para cada familia.
+
+### 2.5.3 Actualizar docs
+
+- `docs/COMPATIBILITY.md`: nuevo rango de transformers, matriz de modelos ampliada, notas por familia (Gemma, DeepSeek, Phi, etc.).
+
+### Verification
+
+- `pip install` con transformers 4.50+ (o la versión objetivo).
+- `AutoModel.get_module_class()` resuelve correctamente para repos de prueba (Qwen2.5, Llama-3.2, Gemma2, Phi3, etc.).
+- Al menos un modelo reciente por familia carga y genera sin error.
+
+---
+
+## Phase 3: Planner + auto strategy + tools
+
+*Hacer esto antes de la CLI/API para que el producto sea útil de verdad: el runtime debe poder decidir la estrategia y ofrecer diagnóstico y benchmarks.*
+
+### 3.1 Módulo planner (`src/rabbitllm/planner/`)
+
+- Detección de VRAM disponible (PyTorch/CUDA).
+- Estimación de memoria del modelo a partir del config (sin compresión, 4bit, 8bit).
+- `ExecutionPlan` (dataclass): profile (balanced/fast/tight), device, dtype, compression, prefetch.
+- Función `plan(model_id_or_path, cache_dir?) -> ExecutionPlan`.
+- Log claro al arrancar: `plan=tight reason="..." strategy="..."`.
+
+### 3.2 Integración con el engine
+
+- `AutoModel.from_pretrained(..., execution_plan=plan)` o que el plan se traduzca a kwargs (device, compression, dtype, prefetch).
+
+### 3.3 Herramientas `rabbit doctor` y `rabbit bench`
+
+- **doctor**: CUDA, driver, VRAM, versiones torch/CUDA, perfil recomendado (usar `utils/platform.py` y lógica del planner).
+- **bench**: script reproducible por modelo (tokens/s, time-to-first-token, pico VRAM, OOM). Reutilizar o extender `profiler.py`.
+
+### 3.4 Config opcional `rabbit.toml`
+
+- `device`, `profile`, `max_vram_percent`, `cache_dir`. El planner lee esto si existe.
+
+### Verification
+
+- Planner elige perfil correcto según VRAM disponible vs estimado.
+- `rabbit doctor` (cuando exista CLI) o script equivalente informa estado del sistema.
+- `rabbit bench <model>` (cuando exista CLI) o script devuelve métricas.
+
+---
+
+## Phase 4: Documentation + Branding + Docker
+
+### 4.1 New README.md
+
+Modern branding with badges, quick start (Python API first; CLI/API cuando existan), architecture diagram, feature list, model table.
+
+### 4.2 Documentation (`docs/`)
+
+- `api-reference.md`, `architecture.md`, `models.md`; más adelante `server-api.md`, `cli-reference.md`.
+
+### 4.3 CONTRIBUTING.md
+
+Dev setup, uv, tests, code style, how to add a new model.
+
+### 4.4 Docker support
+
+`Dockerfile`, `docker-compose.yml` (GPU + model cache), `.dockerignore`.
+
+### 4.5 Benchmarks (`benchmarks/`)
+
+`benchmark_inference.py`, `benchmark_memory.py` — tokens/s y pico VRAM.
+
+### 4.6 Update CLAUDE.md for new structure
+
+### Verification
+
+- `docker build -t rabbitllm .` — works
+- Docs render on GitHub
+- `make test && make lint && make typecheck` — green
+
+---
+
+## Phase 5: CLI + API Server (último)
+
+*Dejar para el final: requiere planner, model manager y streaming para ser realmente útil.*
+
+### 5.1 CLI with Typer (`src/rabbitllm/cli.py`)
 
 Commands:
 
-- `rabbitllm run <model> [-p prompt] [-n max_tokens] [-c 4bit|8bit] [-i interactive]`
-- `rabbitllm pull <model>` — download + prepare
-- `rabbitllm list` — show local models
-- `rabbitllm remove <model>`
-- `rabbitllm serve <model> [--host] [--port]`
+- `rabbit run <model> [-p prompt] [-n max_tokens] [-c 4bit|8bit] [-i interactive]`
+- `rabbit pull <model>` — download + prepare
+- `rabbit list` — show local models
+- `rabbit remove <model>`
+- `rabbit serve <model> [--host] [--port]`
+- `rabbit doctor` — diagnostics (Phase 3)
+- `rabbit bench <model>` — benchmarks (Phase 3)
 
-### 3.2 Model manager (`src/rabbitllm/model_manager.py`)
+### 5.2 Model manager (`src/rabbitllm/model_manager.py`)
 
 `ModelManager` class: `pull()`, `list_models()`, `remove()`, `get_model_path()` — manages local model cache.
 
-### 3.3 FastAPI server with OpenAI-compatible API
+### 5.3 FastAPI server with OpenAI-compatible API
 
 New `src/rabbitllm/server/` package:
 
@@ -145,57 +248,23 @@ New `src/rabbitllm/server/` package:
 - `schemas.py` — Pydantic models (ChatCompletionRequest/Response, etc.)
 - `deps.py` — dependency injection for model instance
 
-### 3.4 Streaming token generation for PyTorch path
+### 5.4 Streaming token generation for PyTorch path
 
-New `generate_stream()` method on `BaseModel` — yields decoded tokens one at a time. Each token requires a full layer-streaming forward pass (inherent to the architecture). Server uses SSE via `sse-starlette`.
+New `generate_stream()` method on `BaseModel` — yields decoded tokens one at a time. Server uses SSE via `sse-starlette`.
 
-### 3.5 Chat template support (`src/rabbitllm/chat.py`)
+### 5.5 Chat template support (`src/rabbitllm/chat.py`)
 
 `ChatFormatter` class: uses `tokenizer.apply_chat_template()` if available, falls back to generic formatting.
 
-### 3.6 Interactive REPL mode
+### 5.6 Interactive REPL mode
 
 In `cli.py` with `--interactive` flag: Rich-based REPL with conversation history, streaming output.
 
 ### Verification
 
-- `rabbitllm pull meta-llama/Llama-3.2-1B` — downloads model
-- `rabbitllm run meta-llama/Llama-3.2-1B -p "Hello"` — generates text
-- `rabbitllm serve meta-llama/Llama-3.2-1B` → `curl localhost:8000/v1/chat/completions` — works
-- Streaming: `"stream": true` returns SSE events
+- `rabbit pull <model>`, `rabbit run <model> -p "Hello"`, `rabbit serve <model>`
+- `curl localhost:8000/v1/chat/completions` — works; streaming con `"stream": true`
 - `pytest tests/test_cli.py tests/test_server.py tests/test_chat.py` — passes
-
----
-
-## Phase 4: Documentation + Branding + Docker
-
-### 4.1 New README.md
-
-Modern branding with badges, quick start (CLI + Python + Server), architecture diagram, feature list, model table, benchmarks.
-
-### 4.2 Documentation (`docs/`)
-
-- `api-reference.md`, `server-api.md`, `cli-reference.md`, `architecture.md`, `models.md`
-
-### 4.3 CONTRIBUTING.md
-
-Dev setup, running tests, code style, how to add a new model.
-
-### 4.4 Docker support
-
-`Dockerfile` (Python 3.11-slim, installs `[server,compression]`), `docker-compose.yml` (with GPU passthrough + model cache volume), `.dockerignore`.
-
-### 4.5 Benchmarks (`benchmarks/`)
-
-`benchmark_inference.py`, `benchmark_memory.py` — measure tokens/sec and peak VRAM.
-
-### 4.6 Update CLAUDE.md for new structure
-
-### Verification
-
-- `docker build -t rabbitllm . && docker run --gpus all rabbitllm serve ...` — works
-- All docs render on GitHub
-- `make test && make lint && make typecheck` — full CI green
 
 ---
 
@@ -213,7 +282,8 @@ Dev setup, running tests, code style, how to add a new model.
 ## Phase Dependencies
 
 ```
-Phase 1 (structure) → Phase 2 (quality) → Phase 3 (features) → Phase 4 (docs)
+Phase 1 (structure) → Phase 2 (quality) → Phase 3 (planner + tools) → Phase 4 (docs + Docker) → Phase 5 (CLI + API)
 ```
 
-Each phase is independently shippable. We execute them in order since later phases build on earlier ones.
+- **Phase 3** (planner, doctor, bench) hace que el runtime sea útil antes de exponer CLI/API.
+- **Phase 5** (CLI + API) va al final: depende del planner y del model manager para ser realmente útil.

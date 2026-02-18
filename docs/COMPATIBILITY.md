@@ -2,8 +2,10 @@
 
 ## Transformers version
 
-- **Supported**: `transformers>=4.47,<4.49` (e.g. 4.47.x or 4.48.x).
-- **Recommended**: Use the latest patch in that range for new model support (Qwen3, DeepSeek V3, Gemma3, etc.).
+- **Supported**: `transformers>=4.47,<4.57` (e.g. 4.47.x through 4.56.x).
+- **Recommended**: Use the latest patch (e.g. 4.56.x) for the widest model support (Qwen3, DeepSeek V3, Gemma2/3, Phi3, Llama 3.2, etc.).
+
+In 4.50+, `GenerationMixin` may need to be imported from `transformers.generation.utils`; the codebase tries both import paths.
 
 Upgrading to 4.47 from 4.46 brings:
 
@@ -20,17 +22,22 @@ Upgrading to 4.47 from 4.46 brings:
 
 ## Model compatibility matrix
 
-| Model / family        | Layer-streaming | Tied lm_head handling | Cache (past_key_value) |
-|-----------------------|-----------------|------------------------|-------------------------|
-| **Llama2 / Llama3**   | Yes             | Yes                    | Standard                |
-| **Qwen2 / Qwen2.5**   | Yes             | Yes                    | Standard                |
-| **Mistral / Mixtral** | Yes             | Yes                    | Standard                |
-| **InternLM**          | Yes             | Yes                    | Standard                |
-| **Baichuan**          | Yes*            | Yes                    | Standard                |
-| **QWen v1**           | Yes             | N/A                    | Uses `layer_past`       |
-| **ChatGLM**           | Yes             | N/A                    | Uses `kv_cache`         |
+| Model / family           | Layer-streaming | Tied lm_head handling | Cache (past_key_value) | Registry mapping   |
+|--------------------------|-----------------|------------------------|-------------------------|--------------------|
+| **Llama2 / Llama3 / 3.2**| Yes             | Yes                    | Standard                | RabbitLLMLlama2    |
+| **Qwen2 / Qwen2.5 / Qwen3** | Yes          | Yes                    | Standard                | RabbitLLMQWen2     |
+| **Mistral / Mixtral**    | Yes             | Yes                    | Standard                | RabbitLLMMistral/Mixtral |
+| **InternLM**             | Yes             | Yes                    | Standard                | RabbitLLMInternLM  |
+| **Baichuan**             | Yes*            | Yes                    | Standard                | RabbitLLMBaichuan  |
+| **Gemma2 / Gemma3**      | Yes**           | Yes                    | Standard                | Llama-like         |
+| **DeepSeek V2 / V3**     | Yes**           | Yes                    | Standard                | Llama-like         |
+| **Phi2 / Phi3 / Phi4**   | Yes**           | Yes                    | Standard                | Llama-like         |
+| **QWen v1**              | Yes             | N/A                    | Uses `layer_past`       | RabbitLLMQWen      |
+| **ChatGLM**              | Yes             | N/A                    | Uses `kv_cache`         | RabbitLLMChatGLM   |
 
 \* Baichuan uses a custom tokenizer (sentencepiece); ensure the dependency is installed.
+
+\*\* Gemma, DeepSeek, Phi are routed to the Llama-based implementation; layer layout is compatible. If a model fails (e.g. different layer names), a dedicated subclass may be needed.
 
 ### Qwen2 / Qwen2.5 with transformers 4.47+
 
