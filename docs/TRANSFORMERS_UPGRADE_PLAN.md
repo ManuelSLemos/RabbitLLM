@@ -179,6 +179,14 @@ Este documento describe un plan por fases para subir la versión de `transformer
 
 ---
 
+## Flash Attention y detección automática
+
+- **Comportamiento "auto"**: Con `attn_implementation="auto"` (por defecto), el motor elige Flash Attention 2 cuando el sistema es compatible (flash-attn instalado, GPU Ampere+, dtype fp16/bf16) y una comprobación en runtime pasa; en caso contrario usa SDPA. No hace falta configurar nada a mano en máquinas compatibles.
+- **Detección**: `is_flash_attention_available()` en `utils/platform.py` comprueba: import de flash-attn, CUDA disponible, capacidad de cómputo ≥ 8.0, y un test mínimo con `flash_attn_func` para detectar incompatibilidades ABI/CUDA en runtime.
+- Documentación: `docs/COMPATIBILITY.md` (sección "Attention implementation (Flash Attention)").
+
+---
+
 ## Orden recomendado de trabajo
 
 1. **Fase 1** (rápida): Ampliar a 4.57.x en `pyproject.toml` y documentación; ejecutar tests.

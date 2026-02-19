@@ -65,6 +65,19 @@ First, install the rabbitllm pip package.
 pip install rabbitllm
 ```
 
+**Optional — Flash Attention 2** (faster attention on Ampere+ GPUs, e.g. RTX 30xx/40xx):  
+Install the `flash` extra so the default `attn_implementation="auto"` can use Flash when your system is compatible:
+
+```bash
+pip install rabbitllm[flash]
+# or with uv (from source):
+uv sync --extra flash
+```
+
+If that fails (no prebuilt wheel for your PyTorch/CUDA/Python), use a **prebuilt wheel** from [flashattn.dev](https://flashattn.dev) and install it: with **uv** run `uv pip install https://...whl` from the project root (no pip binary needed); otherwise `pip install https://...whl` in your venv. See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#flash-attention-installation-fails-build-from-source).
+
+Without flash-attn installed, the model uses SDPA (PyTorch scaled dot-product attention). See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md#attention-implementation-flash-attention) for requirements and how to check if Flash is active.
+
 ### 2. Inference
 
 Then, initialize RabbitLLMLlama2, pass in the huggingface repo ID of the model being used, or the local path, and inference can be performed similar to a regular transformer model.
@@ -138,6 +151,7 @@ While in our case the bottleneck is mainly at the disk loading, we only need to 
 When initialize the model, we support the following configurations:
 
 * **compression**: supported options: 4bit, 8bit for 4-bit or 8-bit block-wise quantization, or by default None for no compression
+* **attn_implementation**: attention backend. Default **`"auto"`** (recommended): uses Flash Attention 2 when the `flash-attn` package is installed and the GPU is Ampere+ (compute capability ≥ 8.0), otherwise SDPA. You can force `"flash_attention_2"`, `"sdpa"`, or `"eager"`. Install with `pip install rabbitllm[flash]` to enable Flash when compatible.
 * **profiling_mode**: supported options: True to output time consumptions or by default False
 * **layer_shards_saving_path**: optionally another path to save the splitted model
 * **token** (or **hf_token**): Hugging Face token for gated repos (e.g. *meta-llama/Llama-2-7b-hf*). Prefer `token` for new code (required in transformers v5).
@@ -261,7 +275,7 @@ model.tokenizer.decode(generation_output.sequences[0])
 Technical notes for developers and contributors:
 
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Design: relationship with HuggingFace, tied weights and `lm_head`, KV cache (DynamicCache), attention implementations (eager, SDPA, FlashAttention 2).
-- **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)** — Transformers version (4.47–4.49), model compatibility matrix, single-file checkpoints.
+- **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)** — Transformers version, model compatibility matrix, **Flash Attention** (optional install, auto-detection), single-file checkpoints.
 - **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — Common issues (zero logits, attention mask, cache errors) and how to debug.
 
 ## Acknowledgement

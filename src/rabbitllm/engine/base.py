@@ -112,7 +112,10 @@ class RabbitLLMBaseModel(GenerationMixin):
             hf_token: Deprecated alias for ``token``; use ``token`` for new code.
             prefetching: Overlap layer load with compute when CUDA available.
             delete_original: If True, delete original checkpoint after splitting.
-            attn_implementation: "auto", "flash_attention_2", "sdpa", or "eager".
+            attn_implementation: "auto" (default), "flash_attention_2", "sdpa", or "eager".
+                With "auto", the best implementation is chosen automatically: Flash Attention 2
+                when the system is compatible (Ampere+ GPU, flash-attn installed, fp16/bf16 dtype),
+                otherwise SDPA. No need to configure manually on supported hardware.
             persister: Optional ModelPersister for layer I/O; default from get_model_persister().
             show_layer_progress: If True, show tqdm progress over layers during forward.
         """
@@ -270,6 +273,16 @@ class RabbitLLMBaseModel(GenerationMixin):
             self.attn_implementation,
             is_flash_attention_available,
         )
+
+    @property
+    def active_attention_implementation(self) -> str:
+        """Attention implementation currently in use.
+
+        One of ``"flash_attention_2"``, ``"sdpa"``, or ``"eager"``. Set at model load
+        (init_model). Use this to confirm whether Flash Attention is active and to
+        compare runs (e.g. auto vs sdpa) for throughput (tokens/s).
+        """
+        return getattr(self, "_active_attn_implementation", "eager")
 
     def init_model(self):
         self.model = None
@@ -550,6 +563,12 @@ class RabbitLLMBaseModel(GenerationMixin):
 
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s):
         if self._active_attn_implementation == "flash_attention_2":
+            # Flash expects mask length to match current context (past + present); passing
+            # full max_seq_len can trigger varlen path with wrong bounds → device-side assert.
+            if full_attention_mask is not None and full_attention_mask.dim() == 2:
+                total = len_p + len_s
+                if full_attention_mask.size(1) > total:
+                    full_attention_mask = full_attention_mask[:, :total].contiguous()
             return {"attention_mask": full_attention_mask}
         if self._active_attn_implementation == "sdpa":
             # SDPA handles causal masking natively via is_causal=True when mask is None.
@@ -743,8 +762,11 @@ class RabbitLLMBaseModel(GenerationMixin):
                                 if self._position_embeddings_cache is not None
                                 else self.get_pos_emb_args(len_p, len_s, layer=layer)
                             )
+                            # cache_position required by transformers 5.x for Flash/SDPA incremental
+                            cache_position = position_ids[:, len_p : len_p + len_s]
                             kwargs = {
                                 "use_cache": True,
+                                "cache_position": cache_position,
                                 **past_key_value_args,
                                 **pos_emb,
                                 **attention_mask_args,

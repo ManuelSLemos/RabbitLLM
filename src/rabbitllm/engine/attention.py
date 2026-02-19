@@ -21,6 +21,11 @@ ATTN_FALLBACK_ORDER = {
 def resolve_attn_implementation(dtype, attn_implementation, is_flash_available_fn):
     """Resolve the best attention implementation to use.
 
+    When ``attn_implementation`` is ``"auto"`` (recommended), this chooses:
+    - **flash_attention_2** if the system is compatible (fp16/bf16 dtype, flash-attn
+      installed, Ampere+ GPU, and a minimal runtime check passes).
+    - **sdpa** otherwise (e.g. no flash-attn, older GPU, or incompatible dtype).
+
     Parameters
     ----------
     dtype : torch.dtype
@@ -28,7 +33,8 @@ def resolve_attn_implementation(dtype, attn_implementation, is_flash_available_f
     attn_implementation : str
         User request: "auto", "flash_attention_2", "sdpa", or "eager".
     is_flash_available_fn : callable
-        Function that returns (ok: bool, message: str).
+        Function that returns (ok: bool, message: str). Typically
+        :func:`rabbitllm.utils.platform.is_flash_attention_available`.
 
     Returns
     -------
@@ -40,17 +46,17 @@ def resolve_attn_implementation(dtype, attn_implementation, is_flash_available_f
 
     if dtype not in (torch.float16, torch.bfloat16):
         logger.info(
-            "dtype %s is not compatible with FlashAttention 2 (requires fp16/bf16). Using SDPA.",
+            "dtype %s is not compatible with Flash Attention 2 (requires fp16/bf16). Using SDPA.",
             dtype,
         )
         return "sdpa"
 
     flash_ok, flash_msg = is_flash_available_fn()
     if flash_ok:
-        logger.info(flash_msg)
+        logger.info("Attention: %s", flash_msg)
         return "flash_attention_2"
 
-    logger.info("FlashAttention not available: %s. Using SDPA.", flash_msg)
+    logger.info("Flash Attention not available: %s. Using SDPA.", flash_msg)
     return "sdpa"
 
 

@@ -137,6 +137,39 @@ For lowest latency when using 70B (or other large) models:
 
 When using `use_cache=True` (incremental decoding), the engine keeps the small layers (embed, norm, lm_head) on GPU across generated tokens instead of reloading them every step, reducing load/transfer for those layers on the second token onward.
 
+## Flash Attention: CUDA device-side assert (varlen_fwd)
+
+**Symptom**: During generation (second or later forward with KV cache), you get `RuntimeError: CUDA error: device-side assert triggered` in `_flash_attn_varlen_forward` or `flash_attn_gpu.varlen_fwd`.
+
+**Cause**: With Flash Attention 2, transformers can use the variable-length path. Passing a full-length attention mask or omitting `cache_position` in the incremental step can lead to wrong bounds and trigger the assert.
+
+**Fix** (in code): The engine now (1) passes **cache_position** in the incremental decoding branch (position of current tokens in the full sequence) and (2) for Flash only, **slices the attention mask** to the current context length (past + present) instead of full `max_seq_len`, so the varlen path does not see inconsistent lengths. If you still see the error on an older commit, pull the latest or backport those two changes.
+
+For debugging you can set `CUDA_LAUNCH_BLOCKING=1` to get a more accurate stack trace.
+
+## Flash Attention: installation fails (build from source)
+
+**Symptom**: `uv sync --extra flash` or `pip install rabbitllm[flash]` fails with "Failed to build flash-attn" or ninja/compilation errors. The log may show "Precompiled wheel not found. Building from source...".
+
+**Cause**: `flash-attn` has no prebuilt wheel for your exact combination of PyTorch version, CUDA version, and Python version. When pip/uv tries to build from source, it often fails (CUDA toolkit, compiler, or download 404 during build).
+
+**What to do**:
+
+1. **Use a prebuilt wheel** (recommended): Go to [flashattn.dev](https://flashattn.dev) or [flashattn.dev/install](https://flashattn.dev/install), select your **PyTorch version**, **CUDA version**, and **Python version**. The site gives you a `pip install https://...whl` command. Run that inside your project environment: with uv, use `uv pip install https://...whl` from the project root (no pip on the host needed); otherwise activate your venv and run `pip install https://...whl`. Then the project will detect Flash and use it with `attn_implementation="auto"` without needing the `rabbitllm[flash]` extra (the extra is only to pull in the dependency; the code works the same once `flash_attn` is importable).
+
+   **Direct wheels (v2.8.3, Linux x86_64, CUDA 12)** from [Dao-AILab/flash-attention releases](https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.3). Use the wheel that matches your PyTorch and Python; `cxx11abiTRUE` is the usual build from pip/uv.
+
+   - **PyTorch 2.5 + Python 3.12** (recommended for this project). From the project root: `uv pip install` (no pip on the host needed). PyTorch installed via uv often uses the **cxx11abiFALSE** ABI; if you get an "undefined symbol" when importing `flash_attn`, try the other variant.
+   ```bash
+   uv pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+   ```
+   If you see `undefined symbol: ... c10::Error ...` at import time, you need the **other** ABI: use `cxx11abiTRUE` if the above is FALSE, or `cxx11abiFALSE` if you had TRUE.
+   - **PyTorch 2.4 + Python 3.12** (fallback if you use torch 2.4): same URL with `torch2.4` instead of `torch2.5`. For other combinations (2.6, 2.7, cp310, cp311), browse the [v2.8.3 assets](https://github.com/Dao-AILab/flash-attention/releases/expanded_assets/v2.8.3).
+
+2. **Stay on SDPA**: If you do not install `flash-attn`, the model uses **SDPA** (PyTorch scaled dot-product attention) with `attn_implementation="auto"`. Inference works normally; you only miss the extra speed/memory benefits of Flash on Ampere+ GPUs.
+
+3. **Build from source** (advanced): Ensure you have the CUDA toolkit, `ninja`, and a C++ compiler matching your PyTorch build; see [flash-attention](https://github.com/Dao-AILab/flash-attention) and [flashattn.dev/troubleshooting](https://flashattn.dev/troubleshooting). The `[tool.uv.extra-build-dependencies]` entry for `flash-attn` in `pyproject.toml` ensures `torch` is available during the build when using `uv sync --extra flash`.
+
 ## CPU vs CUDA: when is CPU faster?
 
 **Symptom**: Inference with `device="cuda:0"` feels slower than with `device="cpu"` for the same model and prompt.

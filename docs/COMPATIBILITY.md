@@ -24,11 +24,40 @@ Some repos (e.g. Meta Llama, certain Gemma variants) are gated. Use a Hugging Fa
 
 - **accelerate** ≥ 1.1.0 (required for transformers 5.x).
 - **sentencepiece** (required for Baichuan tokenizer; add to project dependencies if you use Baichuan).
-- **flash-attn** (optional): for `attn_implementation="flash_attention_2"`; requires Ampere+ GPU and fp16/bf16.
+- **flash-attn** (optional): for Flash Attention 2; requires Ampere+ GPU (compute capability ≥ 8.0) and fp16/bf16.
+
+## Attention implementation (Flash Attention)
+
+The default **`attn_implementation="auto"`** selects the best implementation automatically:
+
+- **Flash Attention 2** is used when:
+  - The optional package `flash-attn` is installed (`pip install flash-attn` or `uv sync --extra flash`),
+  - CUDA is available and the GPU has compute capability ≥ 8.0 (Ampere or newer),
+  - The model dtype is fp16 or bf16,
+  - A minimal runtime check passes (avoids broken installs or ABI mismatches).
+- Otherwise **SDPA** (PyTorch scaled dot-product attention) is used, with fallback to **eager** if the model does not support SDPA.
+
+You do not need to set `attn_implementation="flash_attention_2"` manually on compatible machines; leave the default `"auto"` so the engine enables Flash when possible. To force a specific implementation, pass `"flash_attention_2"`, `"sdpa"`, or `"eager"` (the model creation will still try the fallback chain if the requested one is unavailable).
+
+### How to check if Flash is active and if it helps
+
+- **Compatibility**: Run `from rabbitllm.utils.platform import is_flash_attention_available; print(is_flash_attention_available())` to see whether your system can use Flash (and why not if it returns `(False, "...")`).
+- **What the model uses**: After loading with `AutoModel.from_pretrained(..., attn_implementation="auto")`, check `model.active_attention_implementation` — it will be `"flash_attention_2"`, `"sdpa"`, or `"eager"`.
+- **Logs**: With `logging` at INFO level, you will see either `Attention: Flash Attention 2 available on <GPU name>` or `Flash Attention not available: ... Using SDPA` when the model is created, and `Model initialized with attn_implementation='...'`.
+- **Benchmark**: Use `uv run python scripts/check_attention_and_benchmark.py --benchmark` to print compatibility, the active implementation, and a short throughput comparison (auto vs sdpa vs eager). Higher tokens/s with `auto` (when it uses Flash) means you are getting a benefit.
 
 ## Requirements for transformers 5.x
 
-This project targets `transformers>=5.0`. Ensure: Python 3.10+, PyTorch 2.0+ (2.4+ recommended), **accelerate** ≥ 1.1.0, **peft** ≥ 0.18.0 (if using PEFT), **bitsandbytes** ≥ 0.46.1 (if using quantization). See [TRANSFORMERS_UPGRADE_PLAN.md](TRANSFORMERS_UPGRADE_PLAN.md).
+This project targets `transformers>=5.0`. Ensure: Python 3.10+, **PyTorch ≥ 2.4** (transformers 5.0 uses APIs that require 2.4+), **accelerate** ≥ 1.1.0, **peft** ≥ 0.18.0 (if using PEFT), **bitsandbytes** ≥ 0.46.1 (if using quantization). See [TRANSFORMERS_UPGRADE_PLAN.md](TRANSFORMERS_UPGRADE_PLAN.md).
+
+### PyTorch 2.5 and Flash Attention
+
+**Transformers 5.0** effectively requires PyTorch ≥ 2.4 (e.g. `torch.is_autocast_enabled(device_type)`). Going **down** to PyTorch 2.5 (from 2.10) is supported and often **recommended** if you want Flash Attention with **prebuilt wheels** (2.5 has better wheel coverage than 2.10 for many CUDA/Python combinations). What it involves:
+
+1. **Constraint in the project**: This project uses `torch>=2.5,<2.6` so that `uv sync` / `pip install` resolves to PyTorch 2.5.x exactly, improving the chance of finding a prebuilt flash-attn wheel. No code changes in RabbitLLM are required for 2.5.
+2. **Recreate the environment**: After changing the constraint, run `uv sync` (or `pip install -e .` / reinstall). The lockfile will resolve to PyTorch 2.5.x (and matching CUDA variant if you use a PyTorch index).
+3. **Flash-attn**: With PyTorch 2.5, use [flashattn.dev](https://flashattn.dev) to get a prebuilt wheel for your Python/CUDA, or try `uv sync --extra flash` again (wheels for 2.5 are more commonly available).
+4. **Risks**: None for 2.5 vs 2.10 for this project; we do not rely on 2.10-specific APIs. You only “lose” very new PyTorch features if any; for inference with transformers 5.0, 2.5 is sufficient.
 
 ## Model compatibility matrix
 

@@ -15,7 +15,7 @@ urls = { Homepage = "https://github.com/lyogavin/rabbitllm" }
 requires-python = ">=3.10"
 dependencies = [
     "tqdm",
-    "torch>=2.0",
+    "torch>=2.5,<2.6",
     "transformers>=5.0,<5.1",
     "accelerate>=1.1.0",
     "safetensors>=0.4",
@@ -41,6 +41,10 @@ dev = ["ruff", "pytest", "pytest-cov", "mypy"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rabbitllm"]
+
+# flash-attn needs torch at build time when built from source (no prebuilt wheel)
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
 
 [tool.ruff]
 line-length = 100
