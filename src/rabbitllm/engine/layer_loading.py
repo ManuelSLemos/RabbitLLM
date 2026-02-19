@@ -20,6 +20,7 @@ def load_layer_to_cpu(
     prefetching: bool,
     profiler: Optional[Any] = None,
     persister: Optional[Any] = None,
+    use_pin_memory: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """Load a layer's state_dict from checkpoint to CPU, optionally with pin_memory for prefetch.
 
@@ -32,9 +33,14 @@ def load_layer_to_cpu(
     profiling_mode : bool
         Whether to record timing in profiler.
     prefetching : bool
-        If True and CUDA available, pin memory for faster transfer.
+        If True and CUDA available and use_pin_memory, pin memory for faster transfer.
     profiler : object, optional
         If provided and profiling_mode, must have add_profiling_time(name, elapsed).
+    persister : object, optional
+        ModelPersister for reading layer files.
+    use_pin_memory : bool
+        If True (default), call pin_memory() when prefetching on CUDA. Set to False for
+        very large models where the cost of pin_memory dominates total time.
 
     Returns
     -------
@@ -56,7 +62,7 @@ def load_layer_to_cpu(
     else:
         state_dict = load_layer_output
 
-    if prefetching:
+    if prefetching and use_pin_memory:
         t = time.time()
         if is_cuda_available():
             for k in state_dict.keys():

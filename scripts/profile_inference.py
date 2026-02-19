@@ -31,6 +31,8 @@ def main():
     parser.add_argument("--device", default=None, help="Device (default: cuda:0 if available else cpu)")
     parser.add_argument("--attn-implementation", default="auto", choices=["auto", "flash_attention_2", "sdpa", "eager"],
                         help="Attention implementation (default auto)")
+    parser.add_argument("--no-prefetch-pin-memory", action="store_true",
+                        help="Disable pin_memory in prefetch (recommended for 70B/72B to reduce total time)")
     parser.add_argument("--token", default=None, help="HuggingFace token for gated repos")
     args = parser.parse_args()
 
@@ -45,6 +47,7 @@ def main():
         device=device,
         profiling_mode=True,
         attn_implementation=args.attn_implementation,
+        prefetch_pin_memory=not args.no_prefetch_pin_memory,
         token=args.token,
     )
     load_sec = time.perf_counter() - load_start

@@ -90,6 +90,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         token: Optional[str] = None,
         hf_token: Optional[str] = None,
         prefetching: bool = True,
+        prefetch_pin_memory: bool = True,
         delete_original: bool = False,
         attn_implementation: str = "auto",
         persister: Optional[Any] = None,
@@ -111,6 +112,9 @@ class RabbitLLMBaseModel(GenerationMixin):
             token: HuggingFace token for gated repos (preferred; v5 uses this). Use ``hf_token`` for backward compatibility.
             hf_token: Deprecated alias for ``token``; use ``token`` for new code.
             prefetching: Overlap layer load with compute when CUDA available.
+            prefetch_pin_memory: If True (default), prefetched layers use pin_memory for faster
+                CPU→GPU transfer. Set to False for very large models (e.g. 72B) where the cost of
+                pin_memory dominates (~190 s per step) and disabling it can reduce total time.
             delete_original: If True, delete original checkpoint after splitting.
             attn_implementation: "auto" (default), "flash_attention_2", "sdpa", or "eager".
                 With "auto", the best implementation is chosen automatically: Flash Attention 2
@@ -235,6 +239,7 @@ class RabbitLLMBaseModel(GenerationMixin):
 
         # model weights prefetch cuda stream
         self.prefetching = prefetching
+        self.prefetch_pin_memory = prefetch_pin_memory
 
         if self.compression is not None:
             self.prefetching = False
@@ -423,6 +428,7 @@ class RabbitLLMBaseModel(GenerationMixin):
             self.prefetching,
             self.profiler if self.profiling_mode else None,
             persister=self._persister,
+            use_pin_memory=self.prefetch_pin_memory,
         )
 
     def move_layer_to_device(self, state_dict):

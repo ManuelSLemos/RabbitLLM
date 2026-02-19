@@ -156,6 +156,7 @@ When initialize the model, we support the following configurations:
 * **layer_shards_saving_path**: optionally another path to save the splitted model
 * **token** (or **hf_token**): Hugging Face token for gated repos (e.g. *meta-llama/Llama-2-7b-hf*). Prefer `token` for new code (required in transformers v5).
 * **prefetching**: prefetching to overlap the model loading and compute. By default, turned on. For now, only RabbitLLMLlama2 supports this.
+* **prefetch_pin_memory**: if True (default), prefetched layers use pin_memory for faster CPU→GPU transfer. Set to **False** for very large models (e.g. 70B/72B) where the cost of pin_memory dominates; this can significantly reduce total inference time.
 * **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
 
 ## Local model cache

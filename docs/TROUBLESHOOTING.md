@@ -125,6 +125,8 @@ To profile with a single command (e.g. for 70B), run:
 uv run python scripts/profile_inference.py --model /path/to/70B-or-repo --max-new-tokens 20
 ```
 
+For **70B/72B**, if `pin_memory_to_trigger_load` and `load_safe_tensor_cpu_wait` dominate (~180–200 s per step), disable pin_memory: pass `prefetch_pin_memory=False` when loading the model, or use the script flag `--no-prefetch-pin-memory`. Re-profile to confirm total time drops (often from ~210 s to ~30–40 s per step).
+
 ### Recommended settings for 70B and large models
 
 For lowest latency when using 70B (or other large) models:
