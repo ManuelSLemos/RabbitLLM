@@ -113,11 +113,29 @@ model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", profiling_mode=T
 After a `generate()` call, the profiler prints total time per category:
 
 - **load_safe_tensor** — time loading layer data from disk. If this dominates, use an SSD or consider compression to reduce I/O size.
-- **create_layer_from_state_dict** — time copying layer weights from CPU to VRAM. If this dominates, consider the Fase 3 optimization (second CUDA stream or non_blocking copy).
+- **create_layer_from_state_dict** — time copying layer weights from CPU to VRAM. If this dominates, the engine uses async transfer (second CUDA stream + non_blocking copy) when prefetching on CUDA with at least 2 layers; ensure prefetching is on and you are not using compression.
 - **forward_per_layer** — time spent in the actual forward pass per layer. If this dominates, use SDPA or Flash (see point 1 above).
 - **load_safe_tensor_cpu_wait** — time waiting for the prefetched layer to be ready (should be low when prefetch overlaps well with compute).
 
 Use these to decide whether to optimize disk I/O, CPU→VRAM copy, or attention implementation.
+
+To profile with a single command (e.g. for 70B), run:
+
+```bash
+uv run python scripts/profile_inference.py --model /path/to/70B-or-repo --max-new-tokens 20
+```
+
+### Recommended settings for 70B and large models
+
+For lowest latency when using 70B (or other large) models:
+
+- **Prefetch**: Leave default `prefetching=True`; do not use `compression` if you want speed (compression disables prefetch).
+- **Attention**: Use `attn_implementation="auto"` or `"flash_attention_2"` on Ampere+ GPUs (e.g. RTX 30xx/40xx).
+- **Disk**: Keep the split model on a **local SSD**; avoid network or slow drives.
+- **Generation**: Always pass `use_cache=True` to `model.generate()` so each token uses incremental decoding (KV cache). Ensure the cache is filled (see "KV cache not filled" above if you see the warning).
+- **Length**: Use a smaller `max_new_tokens` if you do not need long replies; time grows linearly with tokens.
+
+When using `use_cache=True` (incremental decoding), the engine keeps the small layers (embed, norm, lm_head) on GPU across generated tokens instead of reloading them every step, reducing load/transfer for those layers on the second token onward.
 
 ## CPU vs CUDA: when is CPU faster?
 

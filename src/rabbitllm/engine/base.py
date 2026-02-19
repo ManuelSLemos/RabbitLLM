@@ -93,6 +93,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         delete_original: bool = False,
         attn_implementation: str = "auto",
         persister: Optional[Any] = None,
+        show_layer_progress: bool = True,
     ) -> None:
         """Initialize the layer-streaming model from a checkpoint or HuggingFace repo.
 
@@ -113,6 +114,7 @@ class RabbitLLMBaseModel(GenerationMixin):
             delete_original: If True, delete original checkpoint after splitting.
             attn_implementation: "auto", "flash_attention_2", "sdpa", or "eager".
             persister: Optional ModelPersister for layer I/O; default from get_model_persister().
+            show_layer_progress: If True, show tqdm progress over layers during forward.
         """
 
         self.profiling_mode = profiling_mode
@@ -226,6 +228,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         self.max_seq_len = max_seq_len
 
         self.main_input_name = "input_ids"
+        self.show_layer_progress = show_layer_progress
 
         # model weights prefetch cuda stream
         self.prefetching = prefetching
@@ -237,8 +240,10 @@ class RabbitLLMBaseModel(GenerationMixin):
         # this operation should run only if gpu is available
         if prefetching and device.startswith("cuda"):
             self.stream = torch.cuda.Stream()
+            self.transfer_stream = torch.cuda.Stream()
         else:
             self.stream = None
+            self.transfer_stream = None
 
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
@@ -600,16 +605,63 @@ class RabbitLLMBaseModel(GenerationMixin):
         all_hidden_states = [[] for _ in range(len(self.layers))] if output_hidden_states else None
         all_self_attns = [[] for _ in range(len(self.layers))] if output_attentions else None
 
+        n_layers = len(self.layer_names)
+        small_layer_names = (
+            self.layer_names_dict["embed"],
+            self.layer_names_dict["norm"],
+            self.layer_names_dict["lm_head"],
+        )
+        # Async transfer (prefetch-2 + non_blocking copy on separate stream) can cause
+        # "Tensor on device cuda is not on expected device meta" with some setups;
+        # use sync path until that is resolved.
+        use_async_transfer = False and (
+            self.prefetching
+            and getattr(self, "transfer_stream", None) is not None
+            and n_layers >= 2
+            and self.hf_quantizer is None
+            and not getattr(self, "_small_layers_on_gpu", False)
+        )
+
         with torch.inference_mode(), ThreadPoolExecutor() as executor:
-            if self.prefetching:
+            if use_async_transfer:
+                # Prefetch 2 + async CPU->GPU transfer: overlap transfer of layer i+1 with forward of layer i
+                if self.profiling_mode:
+                    t = time.time()
+                f0 = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
+                f1 = executor.submit(self.load_layer_to_cpu, self.layer_names[1])
+                s0 = f0.result()
+                s1 = f1.result()
+                if self.profiling_mode:
+                    self.profiler.add_profiling_time("load_safe_tensor_cpu_wait", time.time() - t)
+                if self.profiling_mode:
+                    t = time.time()
+                current_moved_layers = self.move_layer_to_device(s0)
+                if self.profiling_mode:
+                    self.profiler.add_profiling_time(
+                        "create_layer_from_state_dict", time.time() - t
+                    )
+                current_s = s0
+                next_s = s1
+                next_future = executor.submit(self.load_layer_to_cpu, self.layer_names[2]) if n_layers > 2 else None
+            elif self.prefetching:
                 future = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
 
-            for i, (layer_name, layer) in tqdm(
-                enumerate(zip(self.layer_names, self.layers)),
-                desc=f"running layers({self.running_device})",
-                total=len(self.layers),
-            ):
-                if self.prefetching:
+            layer_iter = enumerate(zip(self.layer_names, self.layers))
+            if getattr(self, "show_layer_progress", True):
+                layer_iter = tqdm(
+                    layer_iter,
+                    desc=f"running layers({self.running_device})",
+                    total=len(self.layers),
+                )
+
+            for i, (layer_name, layer) in layer_iter:
+                if layer_name in small_layer_names and getattr(self, "_small_layers_on_gpu", False):
+                    state_dict = {}
+                    moved_layers = []
+                elif use_async_transfer:
+                    state_dict = current_s
+                    moved_layers = current_moved_layers
+                elif self.prefetching:
                     if self.profiling_mode:
                         t = time.time()
                     state_dict = future.result()
@@ -644,6 +696,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                     layer_name == self.layer_names_dict["lm_head"]
                     and len(state_dict) == 0
                     and getattr(self.config, "tie_word_embeddings", False)
+                    and not getattr(self, "_small_layers_on_gpu", False)
                 ):
                     embed_state_dict = self.load_layer_to_cpu(self.layer_names_dict["embed"])
                     embed_key = self.layer_names_dict["embed"] + ".weight"
@@ -773,18 +826,48 @@ class RabbitLLMBaseModel(GenerationMixin):
                 if output_hidden_states:
                     all_hidden_states += (torch.cat(batch, 0),)
 
-                if self.hf_quantizer is not None:
-                    for param_name in moved_layers:
-                        set_module_tensor_to_device(self.model, param_name, "meta")
-                else:
+                skip_meta = (
+                    use_cache and layer_name in small_layer_names
+                )
+                if not skip_meta:
+                    if self.hf_quantizer is not None:
+                        for param_name in moved_layers:
+                            set_module_tensor_to_device(self.model, param_name, "meta")
+                    else:
+                        layer.to("meta")
                     layer.to("meta")
-                layer.to("meta")
                 clean_memory()
                 if self.profiling_mode:
                     self.profiler.add_profiling_time(
                         "forward_per_layer",
                         time.time() - _forward_layer_start,
                     )
+
+                if use_async_transfer and (i + 1) < n_layers:
+                    current_moved_layers = layer_loading_impl.move_layer_to_device_async(
+                        self.model,
+                        next_s,
+                        self.running_device,
+                        self.running_dtype,
+                        stream=self.transfer_stream,
+                        hf_quantizer=self.hf_quantizer,
+                    )
+                    self.transfer_stream.synchronize()
+                    # Ensure default stream sees the transferred params before next forward
+                    torch.cuda.current_stream().wait_stream(self.transfer_stream)
+                    current_s = next_s
+                    if next_future is not None:
+                        next_s = next_future.result()
+                        next_future = (
+                            executor.submit(self.load_layer_to_cpu, self.layer_names[i + 2])
+                            if (i + 2) < n_layers
+                            else None
+                        )
+                    else:
+                        next_s = None
+
+        if use_cache:
+            self._small_layers_on_gpu = True
 
         return batch, kv_cache_list, all_hidden_states, all_self_attns
 
@@ -896,7 +979,12 @@ class RabbitLLMBaseModel(GenerationMixin):
             forward_start = time.process_time()
             forward_start_wall = time.time()
 
-        self._reset_model()
+        if past_key_values is None:
+            self._small_layers_on_gpu = False
+            self._reset_model()
+        # When past_key_values is set (incremental decoding), reuse the same model so
+        # embed/norm/lm_head stay on GPU and we skip loading them again.
+
         batch = self._prepare_batch(input_ids)
         attention_mask, position_ids = self._create_masks()
 

@@ -249,6 +249,7 @@ class RabbitLLMLlamaMlx:
         test_nonlayered=False,
         show_memory_util=False,
         delete_original=False,
+        show_layer_progress=True,
     ):
 
         self._token = token if token is not None else hf_token
@@ -256,6 +257,7 @@ class RabbitLLMLlamaMlx:
         self.set_layer_names_dict()
         self.test_nonlayered = test_nonlayered
         self.show_memory_util = show_memory_util
+        self.show_layer_progress = show_layer_progress
         self.least_available = None
         self.initial_available = psutil.virtual_memory().available / 1024 / 1024
 

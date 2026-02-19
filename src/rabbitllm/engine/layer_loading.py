@@ -70,6 +70,24 @@ def load_layer_to_cpu(
     return state_dict
 
 
+def _param_list_from_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    hf_quantizer: Optional[Any],
+    model: Any,
+) -> List[str]:
+    """Return list of param names to move (one per param, or per layer for quantizer)."""
+    layers = []
+    for param_name in state_dict:
+        if hf_quantizer is None:
+            layers.append(param_name)
+        else:
+            if ".weight" in param_name:
+                layer_name = param_name[: param_name.index(".weight") + len(".weight")]
+                if layer_name not in layers:
+                    layers.append(layer_name)
+    return layers
+
+
 def move_layer_to_device(
     model: Any,
     state_dict: Dict[str, torch.Tensor],
@@ -99,15 +117,7 @@ def move_layer_to_device(
     list of str
         Parameter names that were moved (for later moving back to meta).
     """
-    layers = []
-    for param_name in state_dict:
-        if hf_quantizer is None:
-            layers.append(param_name)
-        else:
-            if ".weight" in param_name:
-                layer_name = param_name[: param_name.index(".weight") + len(".weight")]
-                if layer_name not in layers:
-                    layers.append(layer_name)
+    layers = _param_list_from_state_dict(state_dict, hf_quantizer, model)
 
     for param_name in layers:
         if hf_quantizer is None or not hf_quantizer.check_quantized_param(
@@ -128,5 +138,38 @@ def move_layer_to_device(
                 param_name,
                 device,
                 state_dict,
+            )
+    return layers
+
+
+def move_layer_to_device_async(
+    model: Any,
+    state_dict: Dict[str, torch.Tensor],
+    device: str,
+    dtype: torch.dtype,
+    stream: Optional[torch.cuda.Stream] = None,
+    hf_quantizer: Optional[Any] = None,
+) -> List[str]:
+    """Move a layer's state_dict to device on a CUDA stream with non_blocking copies.
+
+    Overlaps CPU→GPU transfer with compute when used with prefetch: run this on a
+    separate stream while the main stream runs the previous layer's forward. Sync
+    the stream before using the layer. If stream is None or device is CPU, falls
+    back to synchronous move_layer_to_device. Quantized params (hf_quantizer) use
+    the synchronous path.
+    """
+    if stream is None or not device.startswith("cuda") or hf_quantizer is not None:
+        return move_layer_to_device(model, state_dict, device, dtype, hf_quantizer)
+
+    layers = _param_list_from_state_dict(state_dict, hf_quantizer, model)
+    with torch.cuda.stream(stream):
+        for param_name in layers:
+            t = state_dict[param_name].to(device, dtype=dtype, non_blocking=True)
+            set_module_tensor_to_device(
+                model,
+                param_name,
+                device,
+                value=t,
+                dtype=dtype,
             )
     return layers
