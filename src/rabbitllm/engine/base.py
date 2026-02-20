@@ -599,12 +599,17 @@ class RabbitLLMBaseModel(GenerationMixin):
         return getattr(self.model.model, "rotary_emb", None)
 
     def _compute_position_embeddings_from_model(self, batch, position_ids):
-        """Compute (cos, sin) once using the model's rotary_emb. batch: list of tensors (B x (1,T,H)); position_ids: (1,T) or (B,T). Returns (cos, sin) or None."""
+        """Compute (cos, sin) once for RoPE. Prefer get_pos_emb_args (device-side) over the model's rotary_emb (may be on meta). Returns (cos, sin) or None."""
+        stacked = torch.cat(batch, dim=0)
+        seq_len = stacked.size(1)
+        # Prefer device-side computation: model's rotary_emb is on meta and would produce meta tensors, causing "cuda is not on expected device meta" in decoder layers.
+        if callable(getattr(self, "get_pos_emb_args", None)):
+            pos_emb = self.get_pos_emb_args(0, seq_len)
+            if pos_emb is not None and "position_embeddings" in pos_emb:
+                return pos_emb["position_embeddings"]
         rotary = self._get_model_rotary_emb()
         if rotary is None:
             return None
-        stacked = torch.cat(batch, dim=0)
-        seq_len = stacked.size(1)
         pos_slice = position_ids[:, :seq_len]
         with torch.inference_mode():
             cos, sin = rotary(stacked, pos_slice)
@@ -636,11 +641,13 @@ class RabbitLLMBaseModel(GenerationMixin):
             self.layer_names_dict["norm"],
             self.layer_names_dict["lm_head"],
         )
-        # Async transfer (prefetch-2 + non_blocking copy on separate stream) can cause
-        # "Tensor on device cuda is not on expected device meta" with some setups;
-        # use sync path until that is resolved.
-        use_async_transfer = False and (
-            self.prefetching
+        # Async transfer: copy of layer i+1 starts BEFORE forward of layer i so they overlap.
+        # Set to False to fall back to sync prefetch (CPU background load only).
+        # See docs/TROUBLESHOOTING.md "Async CPU→GPU transfer".
+        _try_async_transfer = True
+        use_async_transfer = (
+            _try_async_transfer
+            and self.prefetching
             and getattr(self, "transfer_stream", None) is not None
             and n_layers >= 2
             and self.hf_quantizer is None
@@ -649,13 +656,15 @@ class RabbitLLMBaseModel(GenerationMixin):
 
         with torch.inference_mode(), ThreadPoolExecutor() as executor:
             if use_async_transfer:
-                # Prefetch 2 + async CPU->GPU transfer: overlap transfer of layer i+1 with forward of layer i
+                # Two-phase async: copy of layer i+1 starts BEFORE forward of layer i so they truly overlap.
+                # Phase A (per iter): copy runs on transfer_stream while forward runs on default stream.
+                # Phase B (per iter): after forward, sync transfer_stream and assign params.
                 if self.profiling_mode:
                     t = time.time()
                 f0 = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
-                f1 = executor.submit(self.load_layer_to_cpu, self.layer_names[1])
+                f1 = executor.submit(self.load_layer_to_cpu, self.layer_names[1]) if n_layers > 1 else None
                 s0 = f0.result()
-                s1 = f1.result()
+                s1 = f1.result() if f1 is not None else None
                 if self.profiling_mode:
                     self.profiler.add_profiling_time("load_safe_tensor_cpu_wait", time.time() - t)
                 if self.profiling_mode:
@@ -666,8 +675,17 @@ class RabbitLLMBaseModel(GenerationMixin):
                         "create_layer_from_state_dict", time.time() - t
                     )
                 current_s = s0
-                next_s = s1
-                next_future = executor.submit(self.load_layer_to_cpu, self.layer_names[2]) if n_layers > 2 else None
+                # Kick off async copy of layer 1 NOW — overlaps with forward of layer 0
+                if s1 is not None:
+                    _async_result = layer_loading_impl.move_layer_to_device_async(
+                        self.model, s1, self.running_device, self.running_dtype,
+                        stream=self.transfer_stream, hf_quantizer=self.hf_quantizer,
+                    )
+                    _pending_tensors, _pending_param_names = _async_result
+                    _pending_s_cpu = s1
+                else:
+                    _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
+                _next_cpu_future = executor.submit(self.load_layer_to_cpu, self.layer_names[2]) if n_layers > 2 else None
             elif self.prefetching:
                 future = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
 
@@ -871,28 +889,45 @@ class RabbitLLMBaseModel(GenerationMixin):
                         time.time() - _forward_layer_start,
                     )
 
-                if use_async_transfer and (i + 1) < n_layers:
-                    current_moved_layers = layer_loading_impl.move_layer_to_device_async(
-                        self.model,
-                        next_s,
-                        self.running_device,
-                        self.running_dtype,
-                        stream=self.transfer_stream,
-                        hf_quantizer=self.hf_quantizer,
-                    )
-                    self.transfer_stream.synchronize()
-                    # Ensure default stream sees the transferred params before next forward
-                    torch.cuda.current_stream().wait_stream(self.transfer_stream)
-                    current_s = next_s
-                    if next_future is not None:
-                        next_s = next_future.result()
-                        next_future = (
-                            executor.submit(self.load_layer_to_cpu, self.layer_names[i + 2])
-                            if (i + 2) < n_layers
+                if use_async_transfer:
+                    # Phase B: finalize the copy that ran concurrently with this forward
+                    if _pending_tensors is not None:
+                        self.transfer_stream.synchronize()
+                        torch.cuda.current_stream().wait_stream(self.transfer_stream)
+                        layer_loading_impl.set_layer_params_from_tensors(
+                            self.model,
+                            _pending_tensors,
+                            self.running_device,
+                            self.running_dtype,
+                            use_clone_fallback=True,
+                            use_direct_set=True,
+                        )
+                        current_moved_layers = _pending_param_names
+                        current_s = _pending_s_cpu
+                        _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
+                    # Phase A (next iter): start async copy of layer i+2 to overlap with forward of layer i+1
+                    if (i + 2) < n_layers:
+                        _next_cpu_s = _next_cpu_future.result() if _next_cpu_future is not None else None
+                        if _next_cpu_s is not None:
+                            _async_result = layer_loading_impl.move_layer_to_device_async(
+                                self.model,
+                                _next_cpu_s,
+                                self.running_device,
+                                self.running_dtype,
+                                stream=self.transfer_stream,
+                                hf_quantizer=self.hf_quantizer,
+                            )
+                            _pending_tensors, _pending_param_names = _async_result
+                            _pending_s_cpu = _next_cpu_s
+                        else:
+                            _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
+                        _next_cpu_future = (
+                            executor.submit(self.load_layer_to_cpu, self.layer_names[i + 3])
+                            if (i + 3) < n_layers
                             else None
                         )
                     else:
-                        next_s = None
+                        _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
 
         if use_cache:
             self._small_layers_on_gpu = True

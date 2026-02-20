@@ -88,6 +88,18 @@ RuntimeError: The size of tensor a (14) must match the size of tensor b (64) at 
 
 **Fix**: In `utils.split_and_save_layers()` and `find_or_create_local_splitted_path()`, detect the single-file case (no index, or only `model.safetensors`), and use `safetensors.safe_open` / the list of keys to build the layer list and split or load accordingly.
 
+## Async CPU→GPU transfer
+
+**Context**: To overlap CPU→GPU copy of the next layer with the current layer’s forward pass, the engine can use a separate CUDA stream for the copy and then assign parameters on the default stream after sync. This two-phase flow is implemented in `move_layer_to_device_async` (copy only on the transfer stream) and `set_layer_params_from_tensors` (assign on the default stream after `transfer_stream.synchronize()` and `wait_stream()`).
+
+**Symptom**: With async transfer enabled, you may see `RuntimeError: Tensor on device cuda:0 is not on the expected device meta!` in a decoder layer (e.g. in `input_layernorm`).
+
+**Cause**: Parameters assigned via `set_module_tensor_to_device` (or direct setattr) with tensors that were created on another stream can still be treated as meta when the module runs on the default stream in some PyTorch/accelerate environments.
+
+**How it works (implemented and enabled by default)**: The copy of layer i+1 starts on the transfer stream **before** the forward of layer i, so the two overlap. After the forward of layer i, the engine syncs the transfer stream and assigns the parameters of layer i+1 using in-place `_parameters` dict update (avoids replacing the `Parameter` object). The sync `set_module_tensor_to_device` path (used for layer 0 and as fallback) remains unchanged.
+
+**To disable async**: In `src/rabbitllm/engine/base.py`, in `_run_layer_streaming_loop`, set `_try_async_transfer = False`. The sync prefetch path (CPU background load) will still be used.
+
 ## Speeding up inference (responses in seconds)
 
 To get the lowest latency per token:
@@ -113,7 +125,7 @@ model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", profiling_mode=T
 After a `generate()` call, the profiler prints total time per category:
 
 - **load_safe_tensor** — time loading layer data from disk. If this dominates, use an SSD or consider compression to reduce I/O size.
-- **create_layer_from_state_dict** — time copying layer weights from CPU to VRAM. If this dominates, the engine uses async transfer (second CUDA stream + non_blocking copy) when prefetching on CUDA with at least 2 layers; ensure prefetching is on and you are not using compression.
+- **create_layer_from_state_dict** — time copying layer weights from CPU to VRAM. If this dominates, ensure prefetching is on (it overlaps load-to-CPU with compute). Async CPU→GPU transfer (overlap copy with forward) is implemented but disabled by default; see "Async CPU→GPU transfer" above.
 - **forward_per_layer** — time spent in the actual forward pass per layer. If this dominates, use SDPA or Flash (see point 1 above).
 - **load_safe_tensor_cpu_wait** — time waiting for the prefetched layer to be ready (should be low when prefetch overlaps well with compute).
 

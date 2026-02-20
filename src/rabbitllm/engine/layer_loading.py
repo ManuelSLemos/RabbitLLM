@@ -2,7 +2,7 @@
 
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from accelerate.utils.modeling import set_module_tensor_to_device
@@ -66,7 +66,7 @@ def load_layer_to_cpu(
         t = time.time()
         if is_cuda_available():
             for k in state_dict.keys():
-                state_dict[k].pin_memory()
+                state_dict[k] = state_dict[k].pin_memory()
         else:
             logger.debug("Prefetching is enabled, but no pin_memory operation is needed for CPU.")
         elapsed_time = time.time() - t
@@ -148,29 +148,81 @@ def move_layer_to_device(
     return layers
 
 
-def move_layer_to_device_async(
-    model: Any,
+def copy_layer_to_device_async(
     state_dict: Dict[str, torch.Tensor],
     device: str,
     dtype: torch.dtype,
-    stream: Optional[torch.cuda.Stream] = None,
+    stream: torch.cuda.Stream,
     hf_quantizer: Optional[Any] = None,
-) -> List[str]:
-    """Move a layer's state_dict to device on a CUDA stream with non_blocking copies.
+    model: Optional[Any] = None,
+) -> Tuple[Dict[str, torch.Tensor], List[str]]:
+    """Copy a layer's state_dict to device on a CUDA stream (no module assignment).
 
-    Overlaps CPU→GPU transfer with compute when used with prefetch: run this on a
-    separate stream while the main stream runs the previous layer's forward. Sync
-    the stream before using the layer. If stream is None or device is CPU, falls
-    back to synchronous move_layer_to_device. Quantized params (hf_quantizer) use
-    the synchronous path.
+    Caller must synchronize the stream and then call set_layer_params_from_tensors
+    on the default stream to assign the tensors to the model. Returns (tensors_dict,
+    param_names) for use in set_layer_params_from_tensors and for moving back to meta.
     """
-    if stream is None or not device.startswith("cuda") or hf_quantizer is not None:
-        return move_layer_to_device(model, state_dict, device, dtype, hf_quantizer)
-
-    layers = _param_list_from_state_dict(state_dict, hf_quantizer, model)
+    param_names = _param_list_from_state_dict(state_dict, hf_quantizer, model)
+    tensors_on_device: Dict[str, torch.Tensor] = {}
     with torch.cuda.stream(stream):
-        for param_name in layers:
-            t = state_dict[param_name].to(device, dtype=dtype, non_blocking=True)
+        for param_name in param_names:
+            if hf_quantizer is None or not hf_quantizer.check_quantized_param(
+                model, param_value=None, param_name=param_name, state_dict={}
+            ):
+                t = state_dict[param_name].to(device, dtype=dtype, non_blocking=True)
+                tensors_on_device[param_name] = t
+    return tensors_on_device, param_names
+
+
+def _set_param_direct(model: Any, param_name: str, tensor: torch.Tensor) -> None:
+    """Set a single parameter by full path (e.g. model.layers.0.input_layernorm.weight) without accelerate.
+
+    Uses in-place data replacement (param.data = tensor) when the parameter already exists,
+    to avoid replacing the Parameter object (which can cause stream-visibility issues when the
+    tensor was produced on a non-default CUDA stream). Falls back to setattr for missing params.
+    """
+    parts = param_name.split(".")
+    parent = model
+    for i in range(len(parts) - 1):
+        part = parts[i]
+        parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
+    existing = parent._parameters.get(parts[-1])
+    requires_grad = existing.requires_grad if existing is not None else False
+    new_param = torch.nn.Parameter(tensor.detach(), requires_grad=requires_grad)
+    if existing is not None and existing.device == tensor.device:
+        # Same device: update data in-place (keeps Parameter object identity)
+        existing.data = new_param.data
+    elif existing is not None:
+        # Different device (e.g. meta → cuda): replace directly in _parameters dict
+        parent._parameters[parts[-1]] = new_param
+    else:
+        setattr(parent, parts[-1], new_param)
+
+
+def set_layer_params_from_tensors(
+    model: Any,
+    tensors_on_device: Dict[str, torch.Tensor],
+    device: str,
+    dtype: torch.dtype,
+    use_clone_fallback: bool = False,
+    use_direct_set: bool = False,
+) -> List[str]:
+    """Assign already-on-device tensors to the model (call on default stream after sync).
+
+    Call this after transfer_stream.synchronize() and wait_stream() so the tensors
+    are visible. If use_clone_fallback is True, clones each tensor on the default
+    stream before assigning. If use_direct_set is True, sets parameters via
+    getattr/setattr instead of accelerate (avoids meta/cuda issues in some envs).
+    """
+    param_names = list(tensors_on_device.keys())
+    for param_name in param_names:
+        t = tensors_on_device[param_name]
+        if use_clone_fallback:
+            # Force tensor to be created on default stream (empty_like + copy_ run on current stream)
+            t = torch.empty_like(t, device=t.device, dtype=t.dtype).copy_(t)
+        if use_direct_set:
+            _set_param_direct(model, param_name, t)
+        else:
             set_module_tensor_to_device(
                 model,
                 param_name,
@@ -178,4 +230,29 @@ def move_layer_to_device_async(
                 value=t,
                 dtype=dtype,
             )
-    return layers
+    return param_names
+
+
+def move_layer_to_device_async(
+    model: Any,
+    state_dict: Dict[str, torch.Tensor],
+    device: str,
+    dtype: torch.dtype,
+    stream: Optional[torch.cuda.Stream] = None,
+    hf_quantizer: Optional[Any] = None,
+) -> Union[List[str], Tuple[Dict[str, torch.Tensor], List[str]]]:
+    """Copy a layer's state_dict to device on a CUDA stream (async path) or move synchronously.
+
+    When stream is set and device is CUDA: only copies to GPU on the transfer stream;
+    returns (tensors_dict, param_names). Caller must sync, wait_stream, then call
+    set_layer_params_from_tensors(model, tensors_dict, device, dtype) on the default stream.
+    When stream is None or device is CPU or hf_quantizer is set: falls back to
+    move_layer_to_device and returns List[str].
+    """
+    if stream is None or not device.startswith("cuda") or hf_quantizer is not None:
+        return move_layer_to_device(model, state_dict, device, dtype, hf_quantizer)
+
+    tensors_on_device, param_names = copy_layer_to_device_async(
+        state_dict, device, dtype, stream, hf_quantizer, model
+    )
+    return tensors_on_device, param_names
