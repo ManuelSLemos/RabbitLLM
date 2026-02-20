@@ -43,6 +43,62 @@ def save_quant_state_to_dict(self, packed=True):
     return qs_packed_dict
 
 
+def decompress_after_async_copy(tensors_on_device: dict) -> dict:
+    """Decompress 4-bit/8-bit tensors that have already been copied to a CUDA device.
+
+    Call this on the default CUDA stream after synchronising the transfer stream so
+    the packed weights and quant-state metadata are fully visible.  Returns a dict
+    containing only the decompressed (fp16) param tensors — the quant metadata keys
+    are consumed and freed here.
+
+    If the tensors are not compressed (no ".4bit." / ".8bit." keys) the dict is
+    returned unchanged.
+    """
+    if not bitsandbytes_installed:
+        raise ImportError(
+            "bitsandbytes is required for decompressing 4-bit/8-bit layers. "
+            "Install with: pip install bitsandbytes"
+        )
+
+    has_4bit = any("4bit" in k for k in tensors_on_device)
+    has_8bit = any("8bit" in k for k in tensors_on_device) and not has_4bit
+    if not has_4bit and not has_8bit:
+        return tensors_on_device
+
+    decompressed: dict = {}
+    param_names = [k for k in tensors_on_device if "4bit" not in k and "8bit" not in k]
+    device = next(iter(tensors_on_device.values())).device
+
+    for param_name in param_names:
+        packed = tensors_on_device[param_name]
+        # Collect quant-state entries that belong to this param
+        prefix = param_name + "."
+        quant_meta = {
+            k[len(param_name):]: v
+            for k, v in tensors_on_device.items()
+            if k.startswith(prefix) and k != param_name
+        }
+        if has_4bit:
+            quant_state = bnb.functional.QuantState.from_dict(qs_dict=quant_meta, device=device)
+            decompressed[param_name] = bnb.functional.dequantize_nf4(packed, quant_state)
+        else:  # 8-bit
+            absmax = tensors_on_device.get(param_name + ".8bit.absmax")
+            code = tensors_on_device.get(param_name + ".8bit.code")
+            decompressed[param_name] = bnb.functional.dequantize_blockwise(
+                packed,
+                bnb.functional.QuantState(
+                    absmax=absmax, code=code, blocksize=2048, dtype=torch.float16
+                ),
+            )
+
+    # Release packed tensors and metadata so GPU memory is freed promptly
+    for v in tensors_on_device.values():
+        del v
+    tensors_on_device.clear()
+
+    return decompressed
+
+
 def uncompress_layer_state_dict(layer_state_dict):
     """Dequantize 4bit/8bit layer state_dict to float16; pass-through if not compressed."""
     if not bitsandbytes_installed:

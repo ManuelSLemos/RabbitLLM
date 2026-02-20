@@ -55,7 +55,9 @@ def check_space(
             total_saved_split_files_size_bytes += os.path.getsize(saved_split_file)
 
     if compression == "4bit":
-        total_shard_files_size_bytes = int(total_shard_files_size_bytes / 0.2813)
+        # 4-bit output is ~28% of the bfloat16 input size.
+        # Previous code divided (/ 0.2813) which vastly overestimated needed space.
+        total_shard_files_size_bytes = int(total_shard_files_size_bytes * 0.2813)
     elif compression == "8bit":
         total_shard_files_size_bytes = total_shard_files_size_bytes // 2
 
@@ -78,6 +80,7 @@ def load_layer(
     layer_name: str,
     profiling: bool = False,
     persister: Optional[Any] = None,
+    decompress: bool = True,
 ) -> Union[Dict[str, Any], Tuple[Dict[str, Any], float]]:
     """Load a single layer state_dict from the split checkpoint, optionally with timing.
 
@@ -86,6 +89,9 @@ def load_layer(
         layer_name: Layer key (e.g. "model.layers.0").
         profiling: If True, return (state_dict, elapsed_time) else state_dict.
         persister: Optional ModelPersister; if None, uses get_model_persister().
+        decompress: If True (default), decompress 4-bit/8-bit layers on load.
+            Pass False when using the async transfer pipeline so that decompression
+            is deferred to the GPU after the async copy (see layer_loading.py).
 
     Returns:
         state_dict, or (state_dict, float) when profiling=True.
@@ -96,7 +102,7 @@ def load_layer(
     if profiling:
         t = time.process_time()
 
-    to_return = uncompress_layer_state_dict(layer_state_dict)
+    to_return = uncompress_layer_state_dict(layer_state_dict) if decompress else layer_state_dict
 
     if profiling:
         elapsed_time = time.process_time() - t

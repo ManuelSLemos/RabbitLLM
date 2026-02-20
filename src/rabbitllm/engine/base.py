@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import logging
 import time
 import warnings
@@ -242,9 +243,10 @@ class RabbitLLMBaseModel(GenerationMixin):
         self.prefetching = prefetching
         self.prefetch_pin_memory = prefetch_pin_memory
 
-        if self.compression is not None:
-            self.prefetching = False
-            logger.info("Prefetching not supported with compression. Loading without prefetching.")
+        if self.compression is not None and not prefetching:
+            # Only suppress the info log; prefetching can coexist with compression when the
+            # async pipeline defers decompression to Phase B (see _run_layer_streaming_loop).
+            pass
 
         # this operation should run only if gpu is available
         if prefetching and device.startswith("cuda"):
@@ -421,7 +423,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         )
         self.move_layer_to_device(state_dict)
 
-    def load_layer_to_cpu(self, layer_name):
+    def load_layer_to_cpu(self, layer_name, decompress: bool = True):
         return layer_loading_impl.load_layer_to_cpu(
             self.checkpoint_path,
             layer_name,
@@ -430,6 +432,7 @@ class RabbitLLMBaseModel(GenerationMixin):
             self.profiler if self.profiling_mode else None,
             persister=self._persister,
             use_pin_memory=self.prefetch_pin_memory,
+            decompress=decompress,
         )
 
     def move_layer_to_device(self, state_dict):
@@ -627,6 +630,10 @@ class RabbitLLMBaseModel(GenerationMixin):
         past_key_values,
     ):
         """Run the layer-by-layer streaming forward; returns (batch, kv_cache_list, all_hidden_states, all_self_attns)."""
+        # Free any PyTorch-cached CUDA memory from previous operations before the layer loop.
+        # This maximises available VRAM, especially when OOM risks are high (large embed/lm_head
+        # already on GPU during decode steps, or prior runs leaving fragmented cache).
+        torch.cuda.empty_cache()
         self._fix_attention_head_dim()
         self._position_embeddings_cache = None
         kv_cache_list = [] if use_cache else None
@@ -637,10 +644,15 @@ class RabbitLLMBaseModel(GenerationMixin):
         all_self_attns = [[] for _ in range(len(self.layers))] if output_attentions else None
 
         n_layers = len(self.layer_names)
+        # Layers that stay on GPU between decode tokens (skip_meta=True) and are
+        # treated as "already loaded" during the decode loop (state_dict = {}).
+        # lm_head is intentionally EXCLUDED: on large models (e.g. 72B) it can be
+        # ~2.32 GiB, which — if kept on GPU — leaves no room for the 2-layer async
+        # GPU copy pipeline during decode.  It is instead loaded by the async pipeline
+        # (Phase A of the last decoder layer), overlapping with compute.
         small_layer_names = (
             self.layer_names_dict["embed"],
             self.layer_names_dict["norm"],
-            self.layer_names_dict["lm_head"],
         )
         # Async transfer: copy of layer i+1 starts BEFORE forward of layer i so they overlap.
         # Set to False to fall back to sync prefetch (CPU background load only).
@@ -652,7 +664,20 @@ class RabbitLLMBaseModel(GenerationMixin):
             and getattr(self, "transfer_stream", None) is not None
             and n_layers >= 2
             and self.hf_quantizer is None
-            and not getattr(self, "_small_layers_on_gpu", False)
+            # NOTE: _small_layers_on_gpu (decode steps) is intentionally allowed; the
+            # initialization below skips embed (already on GPU) and starts the async
+            # pipeline from the first decoder layer so GPU↔CPU overlap is preserved.
+        )
+
+        # When compression is active and async is enabled, background threads should load
+        # compressed tensors to CPU WITHOUT decompressing them.  Decompression is then done
+        # on the default CUDA stream in Phase B (after the async GPU copy), keeping background
+        # threads free of CUDA operations and avoiding interference with the forward stream.
+        _async_decompress = use_async_transfer and self.compression is not None
+        _load_cpu_fn = (
+            functools.partial(self.load_layer_to_cpu, decompress=False)
+            if _async_decompress
+            else self.load_layer_to_cpu
         )
 
         with torch.inference_mode(), ThreadPoolExecutor() as executor:
@@ -661,40 +686,77 @@ class RabbitLLMBaseModel(GenerationMixin):
                 # Phase A (per iter): copy runs on transfer_stream while forward runs on default stream.
                 # Phase B (per iter): after forward, sync transfer_stream and assign params.
                 use_dual_prefetch = n_layers > 3
+                # During decode steps, embed/norm/lm_head are already on GPU (_small_layers_on_gpu=True).
+                # Skip loading layer 0 (embed) and seed the pipeline from decoder layers directly.
+                _async_skip_layer0 = getattr(self, "_small_layers_on_gpu", False)
                 if self.profiling_mode:
                     t = time.time()
                 if use_dual_prefetch:
-                    # Submit four loads so two layers stay in flight (2 and 3) while we use 0 and 1.
-                    f0 = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
-                    f1 = executor.submit(self.load_layer_to_cpu, self.layer_names[1])
-                    f2 = executor.submit(self.load_layer_to_cpu, self.layer_names[2])
-                    f3 = executor.submit(self.load_layer_to_cpu, self.layer_names[3])
-                    s0 = f0.result()
-                    s1 = f1.result()
-                    _next_cpu_future_0 = f2
-                    _next_cpu_idx_0 = 2
-                    _next_cpu_future_1 = f3
-                    _next_cpu_idx_1 = 3
+                    if _async_skip_layer0:
+                        # Embed already on GPU: load decoder_0, decoder_1, decoder_2 as the
+                        # first three in-flight items (s1 + two prefetch slots).
+                        fa = executor.submit(_load_cpu_fn, self.layer_names[1])
+                        fb = executor.submit(_load_cpu_fn, self.layer_names[2]) if n_layers > 2 else None
+                        fc = executor.submit(_load_cpu_fn, self.layer_names[3]) if n_layers > 3 else None
+                        s0 = {}  # embed placeholder — already on GPU
+                        s1 = fa.result()  # decoder_0
+                        _next_cpu_future_0 = fb  # decoder_1, absolute index 2
+                        _next_cpu_idx_0 = 2 if n_layers > 2 else -1
+                        _next_cpu_future_1 = fc  # decoder_2, absolute index 3
+                        _next_cpu_idx_1 = 3 if n_layers > 3 else -1
+                    else:
+                        # Normal prefill: submit four loads so two layers stay in flight.
+                        f0 = executor.submit(_load_cpu_fn, self.layer_names[0])
+                        f1 = executor.submit(_load_cpu_fn, self.layer_names[1])
+                        f2 = executor.submit(_load_cpu_fn, self.layer_names[2])
+                        f3 = executor.submit(_load_cpu_fn, self.layer_names[3])
+                        s0 = f0.result()
+                        s1 = f1.result()
+                        _next_cpu_future_0 = f2
+                        _next_cpu_idx_0 = 2
+                        _next_cpu_future_1 = f3
+                        _next_cpu_idx_1 = 3
                 else:
-                    f0 = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
-                    f1 = executor.submit(self.load_layer_to_cpu, self.layer_names[1]) if n_layers > 1 else None
-                    s0 = f0.result()
-                    s1 = f1.result() if f1 is not None else None
-                    _next_cpu_future_0 = executor.submit(self.load_layer_to_cpu, self.layer_names[2]) if n_layers > 2 else None
-                    _next_cpu_idx_0 = 2 if n_layers > 2 else -1
-                    _next_cpu_future_1 = None
-                    _next_cpu_idx_1 = -1
+                    if _async_skip_layer0:
+                        fa = executor.submit(_load_cpu_fn, self.layer_names[1])
+                        fb = executor.submit(_load_cpu_fn, self.layer_names[2]) if n_layers > 2 else None
+                        s0 = {}
+                        s1 = fa.result()
+                        _next_cpu_future_0 = fb
+                        _next_cpu_idx_0 = 2 if n_layers > 2 else -1
+                        _next_cpu_future_1 = None
+                        _next_cpu_idx_1 = -1
+                    else:
+                        f0 = executor.submit(_load_cpu_fn, self.layer_names[0])
+                        f1 = executor.submit(_load_cpu_fn, self.layer_names[1]) if n_layers > 1 else None
+                        s0 = f0.result()
+                        s1 = f1.result() if f1 is not None else None
+                        _next_cpu_future_0 = executor.submit(_load_cpu_fn, self.layer_names[2]) if n_layers > 2 else None
+                        _next_cpu_idx_0 = 2 if n_layers > 2 else -1
+                        _next_cpu_future_1 = None
+                        _next_cpu_idx_1 = -1
                 if self.profiling_mode:
                     self.profiler.add_profiling_time("load_safe_tensor_cpu_wait", time.time() - t)
                 if self.profiling_mode:
                     t = time.time()
-                current_moved_layers = self.move_layer_to_device(s0)
+                if _async_skip_layer0:
+                    # Embed is already on GPU; no synchronous move needed for layer 0.
+                    current_moved_layers = []
+                    current_s = {}
+                else:
+                    # s0 was loaded via _load_cpu_fn which may have decompress=False
+                    # (async+compression path). Decompress it now before the synchronous
+                    # move so set_module_tensor_to_device does not see .4bit.* keys.
+                    if _async_decompress and s0:
+                        from ..utils.compression import uncompress_layer_state_dict
+                        s0 = uncompress_layer_state_dict(s0)
+                    current_moved_layers = self.move_layer_to_device(s0)
+                    current_s = s0
                 if self.profiling_mode:
                     self.profiler.add_profiling_time(
                         "create_layer_from_state_dict", time.time() - t
                     )
-                current_s = s0
-                # Kick off async copy of layer 1 NOW — overlaps with forward of layer 0
+                # Kick off async copy of first decoder layer NOW — overlaps with forward of embed (or layer 0).
                 if s1 is not None:
                     _async_result = layer_loading_impl.move_layer_to_device_async(
                         self.model, s1, self.running_device, self.running_dtype,
@@ -705,10 +767,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                 else:
                     _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
             elif self.prefetching:
-                # In incremental steps (small layers already on GPU), embed is skipped in the loop
-                # so start the prefetch from the first decoder layer (index 1) to stay in sync.
-                _prefetch_start = 1 if getattr(self, "_small_layers_on_gpu", False) else 0
-                future = executor.submit(self.load_layer_to_cpu, self.layer_names[_prefetch_start])
+                future = executor.submit(_load_cpu_fn, self.layer_names[0])
 
             layer_iter = enumerate(zip(self.layer_names, self.layers))
             if getattr(self, "show_layer_progress", True):
@@ -743,7 +802,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                     if (i + 1) < len(self.layer_names):
                         if self.profiling_mode:
                             t = time.time()
-                        future = executor.submit(self.load_layer_to_cpu, self.layer_names[i + 1])
+                        future = executor.submit(_load_cpu_fn, self.layer_names[i + 1])
                         if self.profiling_mode:
                             self.profiler.add_profiling_time("kick_off_load_cpu", time.time() - t)
                 else:
@@ -907,7 +966,6 @@ class RabbitLLMBaseModel(GenerationMixin):
                             set_module_tensor_to_device(self.model, param_name, "meta")
                     else:
                         layer.to("meta")
-                    layer.to("meta")
                 clean_memory()
                 if self.profiling_mode:
                     self.profiler.add_profiling_time(
@@ -920,12 +978,22 @@ class RabbitLLMBaseModel(GenerationMixin):
                     if _pending_tensors is not None:
                         self.transfer_stream.synchronize()
                         torch.cuda.current_stream().wait_stream(self.transfer_stream)
+                        # For compressed models: decompress packed tensors on GPU (default stream)
+                        # AFTER the async copy finishes.  This keeps the background threads free
+                        # of CUDA ops and ensures decompression does not race with the forward.
+                        if _async_decompress:
+                            _pending_tensors, _pending_param_names = (
+                                layer_loading_impl.decompress_layer_on_device(_pending_tensors)
+                            )
+                        # use_clone_fallback=False: after synchronize()+wait_stream() the tensors
+                        # are fully visible on the default stream — no clone needed, and cloning
+                        # would double peak VRAM (critical when embed+lm_head are already on GPU).
                         layer_loading_impl.set_layer_params_from_tensors(
                             self.model,
                             _pending_tensors,
                             self.running_device,
                             self.running_dtype,
-                            use_clone_fallback=True,
+                            use_clone_fallback=False,
                             use_direct_set=True,
                         )
                         current_moved_layers = _pending_param_names
@@ -961,14 +1029,14 @@ class RabbitLLMBaseModel(GenerationMixin):
                             # Refill consumed slot with load(i+4); the other slot already has i+3
                             if _consumed_slot == 0:
                                 _next_cpu_future_0 = (
-                                    executor.submit(self.load_layer_to_cpu, self.layer_names[i + 4])
+                                    executor.submit(_load_cpu_fn, self.layer_names[i + 4])
                                     if (i + 4) < n_layers
                                     else None
                                 )
                                 _next_cpu_idx_0 = (i + 4) if (i + 4) < n_layers else -1
                             elif _consumed_slot == 1:
                                 _next_cpu_future_1 = (
-                                    executor.submit(self.load_layer_to_cpu, self.layer_names[i + 4])
+                                    executor.submit(_load_cpu_fn, self.layer_names[i + 4])
                                     if (i + 4) < n_layers
                                     else None
                                 )
@@ -989,7 +1057,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                             else:
                                 _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
                             _next_cpu_future_0 = (
-                                executor.submit(self.load_layer_to_cpu, self.layer_names[i + 3])
+                                executor.submit(_load_cpu_fn, self.layer_names[i + 3])
                                 if (i + 3) < n_layers
                                 else None
                             )

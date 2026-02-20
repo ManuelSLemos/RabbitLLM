@@ -17,6 +17,7 @@ Métricas: acumuladas por paso de generación (suma de 83 capas). Wall time en s
 | 5 | Flash ON · async ON · pin_memory **OFF** | ~0 | ~0.006 | ~3.0 | ~10 | **~266** ❌ | **~2132** ❌ | medición 2025-02-20 |
 | 6 | Flash ON · async ON · pin_memory ON · **dual prefetch** · single pinned buffer | ~434–454 | ~9.5–13 | ~0.21 | ~29–35 | **~219–223** | — (interrumpido) | 2 pasos medidos |
 | 7 | Flash ON · async ON · pin_memory ON · **dual prefetch only** (sin single buffer) | ~400 | ~8.2 | ~0.21 | ~32 | **~203** ✅ | — (interrumpido) | 1 paso completo |
+| 8 | Fila 7 + **fix decode** (lm_head excluido de GPU persistente) | ~376–381 | **~4–6** ✅ | ~0.4 prefill / **~0** decode ✅ | ~30–32 | **~194–196** ✅ | **~1755** est. | 3 tokens medidos (prefill + 2 decode sin OOM) |
 
 > `create_layer` en la fila 4 solo registra layer 0 (las restantes 82 capas van por async y no se miden en ese contador). En fila 5, `create_layer` ~3 s (83 capas en async, sin pin_memory).
 
@@ -32,6 +33,7 @@ async ON (4):     ████████████████████�
 pin_mem OFF (5):  █████████████████████████  ~266 s   (+34% vs 4 — EMPEORÓ; mantener pin_memory ON)
 dual prefetch (6): ████████████████████████  ~221 s   (+11% vs 4 — single buffer empeoró)
 dual prefetch only (7): ███████████████████████  ~203 s   (~2% mejor que 4; sin single buffer)
+fix decode (8):   ██████████████████████  ~195 s   (prefill=195 decode=195 ✅ primer decode funcional)
 ```
 
 ---
@@ -71,7 +73,14 @@ Con async + `--no-prefetch-pin-memory`:
 ### Fila 6 → Fila 7: dual prefetch only (sin single buffer) — resultado medido
 - **Medido**: wall **~203 s/paso** (1 paso completo). Ligera mejora vs Fila 4 (~199 s) y vs Fila 6 (~221 s).
 - **pin_memory** ~400 s por paso (con 2 hilos el profiler suma ambos; equivalente ~200 s efectivos, en línea con Fila 4).
-- **Conclusión**: Quitar el single buffer recupera tiempos de pin razonables. Dual prefetch solo da una mejora marginal (~2%) respecto a Fila 4; no se acerca al objetivo ~100 s. La configuración actual recomendada es **Fila 7** (dual prefetch + pin_memory por tensor).
+- **Conclusión**: Quitar el single buffer recupera tiempos de pin razonables. Dual prefetch solo da una mejora marginal (~2%) respecto a Fila 4. Los decode seguían crasheando por OOM (ver Fila 8).
+
+### Fila 7 → Fila 8: fix decode (lm_head excluido de GPU persistente) — 2026-02-20
+- **Problema corregido**: lm_head (~2.32 GiB para 72B) se quedaba en GPU entre tokens de decode (`skip_meta=True`). Junto con embed (~2.32 GiB) y el pipeline async de 2 decoder layers (~0.92 GiB), el total superaba los 7.75 GiB y causaba OOM en todos los pasos de decode.
+- **Fix**: `small_layer_names` reducido a `(embed, norm)`. `lm_head` pasa a recargarse vía async pipeline (Phase A del último decoder layer lo prefetcha, solapado con el forward).
+- **Medido**: 3 pasos completos (prefill + 2 decode). Wall prefill=**195.52 s**, decode2=**195.53 s**, decode3=**193.88 s**. cpu_wait decode: **~5 s** (vs 197 s antes del fix).
+- **Overhead lm_head cero**: los ~3.3 s de carga del lm_head quedan completamente solapados con el forward de los últimos decoder layers. Wall decode ≈ Wall prefill.
+- **Conclusión**: **Primer decode funcional** para 72B en GPU de 8 GiB. La configuración actual recomendada es **Fila 8** (Fila 7 + fix decode).
 
 ---
 
@@ -94,4 +103,5 @@ uv run python scripts/profile_inference.py \
 | Fila 4 | `pin_memory` en hilo prefetch, ahora más visible (~200 s/paso) |
 | Fila 5 (medido) | Wall 266 s vs process 162 s → ~104 s de espera (transfer CPU→GPU sin pin_memory); mantener pin_memory ON |
 | Fila 6 (medido) | Wall ~221 s. pin_memory ~434 s (single buffer empeoró) |
-| Fila 7 (medido) | Dual prefetch only: wall ~203 s (~2% mejor que 4). Configuración recomendada |
+| Fila 7 (medido) | Dual prefetch only: wall ~203 s (~2% mejor que 4). Decode crasheaba por OOM |
+| Fila 8 (medido) | Fix decode: wall ~195 s prefill y **~195 s decode** ✅. cpu_wait decode ~5 s. Configuración recomendada |

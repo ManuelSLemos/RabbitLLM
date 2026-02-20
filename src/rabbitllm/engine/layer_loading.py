@@ -21,6 +21,7 @@ def load_layer_to_cpu(
     profiler: Optional[Any] = None,
     persister: Optional[Any] = None,
     use_pin_memory: bool = True,
+    decompress: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """Load a layer's state_dict from checkpoint to CPU, optionally with pin_memory for prefetch.
 
@@ -41,15 +42,19 @@ def load_layer_to_cpu(
     use_pin_memory : bool
         If True (default), call pin_memory() when prefetching on CUDA. Set to False for
         very large models where the cost of pin_memory dominates total time.
+    decompress : bool
+        If True (default), decompress 4-bit/8-bit layers immediately after loading.
+        Pass False when using the async GPU transfer pipeline so that decompression is
+        deferred to Phase B on the default CUDA stream (see base.py Phase B logic).
 
     Returns
     -------
     dict
-        state_dict for the layer.
+        state_dict for the layer (CPU tensors, possibly compressed when decompress=False).
     """
     t = time.time()
     load_layer_output = load_layer(
-        checkpoint_path, layer_name, profiling_mode, persister=persister
+        checkpoint_path, layer_name, profiling_mode, persister=persister, decompress=decompress
     )
     elapsed_time = time.time() - t
 
@@ -66,7 +71,9 @@ def load_layer_to_cpu(
         t = time.time()
         if is_cuda_available():
             for k in state_dict.keys():
-                state_dict[k] = state_dict[k].pin_memory()
+                # Only pin CPU tensors; skip tensors already on GPU (e.g. from eager decompress)
+                if state_dict[k].device.type == "cpu":
+                    state_dict[k] = state_dict[k].pin_memory()
         else:
             logger.debug("Prefetching is enabled, but no pin_memory operation is needed for CPU.")
         elapsed_time = time.time() - t
@@ -161,6 +168,10 @@ def copy_layer_to_device_async(
     Caller must synchronize the stream and then call set_layer_params_from_tensors
     on the default stream to assign the tensors to the model. Returns (tensors_dict,
     param_names) for use in set_layer_params_from_tensors and for moving back to meta.
+
+    Handles compressed (4-bit/8-bit) state dicts: packed uint8 weight tensors and
+    quant-state metadata tensors are copied without dtype conversion so they remain
+    intact for decompression in Phase B via decompress_layer_on_device().
     """
     param_names = _param_list_from_state_dict(state_dict, hf_quantizer, model)
     tensors_on_device: Dict[str, torch.Tensor] = {}
@@ -169,9 +180,33 @@ def copy_layer_to_device_async(
             if hf_quantizer is None or not hf_quantizer.check_quantized_param(
                 model, param_value=None, param_name=param_name, state_dict={}
             ):
-                t = state_dict[param_name].to(device, dtype=dtype, non_blocking=True)
+                src = state_dict[param_name]
+                # Preserve dtype for non-floating tensors (packed uint8 weights, quant metadata)
+                # and for quant-state keys (identified by ".4bit." / ".8bit." in the name).
+                # Only apply the model dtype to regular floating-point weight tensors.
+                if src.is_floating_point() and ".4bit." not in param_name and ".8bit." not in param_name:
+                    t = src.to(device, dtype=dtype, non_blocking=True)
+                else:
+                    t = src.to(device, non_blocking=True)
                 tensors_on_device[param_name] = t
     return tensors_on_device, param_names
+
+
+def decompress_layer_on_device(
+    tensors_on_device: Dict[str, torch.Tensor],
+) -> Tuple[Dict[str, torch.Tensor], List[str]]:
+    """Decompress 4-bit/8-bit tensors already on GPU.
+
+    Call this on the default CUDA stream after synchronising the transfer stream
+    (Phase B).  Returns (decompressed_tensors, param_names) ready for
+    set_layer_params_from_tensors().  If the tensors are not compressed the
+    input is returned unchanged alongside its key list.
+    """
+    from ..utils.compression import decompress_after_async_copy
+
+    decompressed = decompress_after_async_copy(tensors_on_device)
+    param_names = list(decompressed.keys())
+    return decompressed, param_names
 
 
 def _set_param_direct(model: Any, param_name: str, tensor: torch.Tensor) -> None:
