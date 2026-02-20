@@ -659,12 +659,30 @@ class RabbitLLMBaseModel(GenerationMixin):
                 # Two-phase async: copy of layer i+1 starts BEFORE forward of layer i so they truly overlap.
                 # Phase A (per iter): copy runs on transfer_stream while forward runs on default stream.
                 # Phase B (per iter): after forward, sync transfer_stream and assign params.
+                use_dual_prefetch = n_layers > 3
                 if self.profiling_mode:
                     t = time.time()
-                f0 = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
-                f1 = executor.submit(self.load_layer_to_cpu, self.layer_names[1]) if n_layers > 1 else None
-                s0 = f0.result()
-                s1 = f1.result() if f1 is not None else None
+                if use_dual_prefetch:
+                    # Submit four loads so two layers stay in flight (2 and 3) while we use 0 and 1.
+                    f0 = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
+                    f1 = executor.submit(self.load_layer_to_cpu, self.layer_names[1])
+                    f2 = executor.submit(self.load_layer_to_cpu, self.layer_names[2])
+                    f3 = executor.submit(self.load_layer_to_cpu, self.layer_names[3])
+                    s0 = f0.result()
+                    s1 = f1.result()
+                    _next_cpu_future_0 = f2
+                    _next_cpu_idx_0 = 2
+                    _next_cpu_future_1 = f3
+                    _next_cpu_idx_1 = 3
+                else:
+                    f0 = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
+                    f1 = executor.submit(self.load_layer_to_cpu, self.layer_names[1]) if n_layers > 1 else None
+                    s0 = f0.result()
+                    s1 = f1.result() if f1 is not None else None
+                    _next_cpu_future_0 = executor.submit(self.load_layer_to_cpu, self.layer_names[2]) if n_layers > 2 else None
+                    _next_cpu_idx_0 = 2 if n_layers > 2 else -1
+                    _next_cpu_future_1 = None
+                    _next_cpu_idx_1 = -1
                 if self.profiling_mode:
                     self.profiler.add_profiling_time("load_safe_tensor_cpu_wait", time.time() - t)
                 if self.profiling_mode:
@@ -685,7 +703,6 @@ class RabbitLLMBaseModel(GenerationMixin):
                     _pending_s_cpu = s1
                 else:
                     _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
-                _next_cpu_future = executor.submit(self.load_layer_to_cpu, self.layer_names[2]) if n_layers > 2 else None
             elif self.prefetching:
                 future = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
 
@@ -907,25 +924,67 @@ class RabbitLLMBaseModel(GenerationMixin):
                         _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
                     # Phase A (next iter): start async copy of layer i+2 to overlap with forward of layer i+1
                     if (i + 2) < n_layers:
-                        _next_cpu_s = _next_cpu_future.result() if _next_cpu_future is not None else None
-                        if _next_cpu_s is not None:
-                            _async_result = layer_loading_impl.move_layer_to_device_async(
-                                self.model,
-                                _next_cpu_s,
-                                self.running_device,
-                                self.running_dtype,
-                                stream=self.transfer_stream,
-                                hf_quantizer=self.hf_quantizer,
-                            )
-                            _pending_tensors, _pending_param_names = _async_result
-                            _pending_s_cpu = _next_cpu_s
+                        need_idx = i + 2
+                        if use_dual_prefetch:
+                            # Wait for the slot that has layer need_idx
+                            if _next_cpu_idx_0 == need_idx and _next_cpu_future_0 is not None:
+                                _next_cpu_s = _next_cpu_future_0.result()
+                                _consumed_slot = 0
+                            elif _next_cpu_idx_1 == need_idx and _next_cpu_future_1 is not None:
+                                _next_cpu_s = _next_cpu_future_1.result()
+                                _consumed_slot = 1
+                            else:
+                                _next_cpu_s = None
+                                _consumed_slot = -1
+                            if _next_cpu_s is not None:
+                                _async_result = layer_loading_impl.move_layer_to_device_async(
+                                    self.model,
+                                    _next_cpu_s,
+                                    self.running_device,
+                                    self.running_dtype,
+                                    stream=self.transfer_stream,
+                                    hf_quantizer=self.hf_quantizer,
+                                )
+                                _pending_tensors, _pending_param_names = _async_result
+                                _pending_s_cpu = _next_cpu_s
+                            else:
+                                _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
+                            # Refill consumed slot with load(i+4); the other slot already has i+3
+                            if _consumed_slot == 0:
+                                _next_cpu_future_0 = (
+                                    executor.submit(self.load_layer_to_cpu, self.layer_names[i + 4])
+                                    if (i + 4) < n_layers
+                                    else None
+                                )
+                                _next_cpu_idx_0 = (i + 4) if (i + 4) < n_layers else -1
+                            elif _consumed_slot == 1:
+                                _next_cpu_future_1 = (
+                                    executor.submit(self.load_layer_to_cpu, self.layer_names[i + 4])
+                                    if (i + 4) < n_layers
+                                    else None
+                                )
+                                _next_cpu_idx_1 = (i + 4) if (i + 4) < n_layers else -1
                         else:
-                            _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
-                        _next_cpu_future = (
-                            executor.submit(self.load_layer_to_cpu, self.layer_names[i + 3])
-                            if (i + 3) < n_layers
-                            else None
-                        )
+                            _next_cpu_s = _next_cpu_future_0.result() if _next_cpu_future_0 is not None else None
+                            if _next_cpu_s is not None:
+                                _async_result = layer_loading_impl.move_layer_to_device_async(
+                                    self.model,
+                                    _next_cpu_s,
+                                    self.running_device,
+                                    self.running_dtype,
+                                    stream=self.transfer_stream,
+                                    hf_quantizer=self.hf_quantizer,
+                                )
+                                _pending_tensors, _pending_param_names = _async_result
+                                _pending_s_cpu = _next_cpu_s
+                            else:
+                                _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
+                            _next_cpu_future_0 = (
+                                executor.submit(self.load_layer_to_cpu, self.layer_names[i + 3])
+                                if (i + 3) < n_layers
+                                else None
+                            )
+                            _next_cpu_idx_0 = (i + 3) if (i + 3) < n_layers else -1
                     else:
                         _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
 

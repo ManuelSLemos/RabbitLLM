@@ -15,6 +15,8 @@ Métricas: acumuladas por paso de generación (suma de 83 capas). Wall time en s
 | 3 | Flash ON · async OFF · pin_memory **OFF** | ~0 | ~4 | **~273–282** ⬆️ | ~15–18 | **~293–302** ⬆️ | — | plan `siguiente_paso_72b_920d7e9b` |
 | 4 | Flash ON · async **ON** · pin_memory ON | ~195–205 | ~3.8–4.9 | **~0.21** ✅ | ~18–23 | **~194–204** ✅ | **1588** ✅ | terminal actual |
 | 5 | Flash ON · async ON · pin_memory **OFF** | ~0 | ~0.006 | ~3.0 | ~10 | **~266** ❌ | **~2132** ❌ | medición 2025-02-20 |
+| 6 | Flash ON · async ON · pin_memory ON · **dual prefetch** · single pinned buffer | ~434–454 | ~9.5–13 | ~0.21 | ~29–35 | **~219–223** | — (interrumpido) | 2 pasos medidos |
+| 7 | Flash ON · async ON · pin_memory ON · **dual prefetch only** (sin single buffer) | ~400 | ~8.2 | ~0.21 | ~32 | **~203** ✅ | — (interrumpido) | 1 paso completo |
 
 > `create_layer` en la fila 4 solo registra layer 0 (las restantes 82 capas van por async y no se miden en ese contador). En fila 5, `create_layer` ~3 s (83 capas en async, sin pin_memory).
 
@@ -28,6 +30,8 @@ Flash ON (2):     ████████████████████�
 pin_mem OFF (3):  ████████████████████████████  ~297 s   (+37%, EMPEORÓ sin async)
 async ON (4):     ████████████████████████  ~199 s   (-8%, async oculta create_layer)
 pin_mem OFF (5):  █████████████████████████  ~266 s   (+34% vs 4 — EMPEORÓ; mantener pin_memory ON)
+dual prefetch (6): ████████████████████████  ~221 s   (+11% vs 4 — single buffer empeoró)
+dual prefetch only (7): ███████████████████████  ~203 s   (~2% mejor que 4; sin single buffer)
 ```
 
 ---
@@ -59,15 +63,24 @@ Con async + `--no-prefetch-pin-memory`:
 - **Medido**: wall **~266 s/paso**, total 8 tokens **~2132 s** (~35 min)  
 - **Conclusión**: **~34% más lento que Fila 4** (~199 s/paso). Sin pinned memory, la transferencia CPU→GPU (en el prefetch async o en el main thread) sigue siendo el cuello; el proceso reporta ~162 s CPU pero wall ~266 s, indicando espera (p. ej. transferencias más lentas sin DMA). **Recomendación**: mantener `pin_memory` ON para este modelo/GPU.
 
+### Fila 5 → Fila 6: dual prefetch + single pinned buffer — resultado medido (2 pasos)
+- **Medido**: wall **~219–223 s/paso** (2 pasos; medición interrumpida). Similar a Fila 4 (~199 s), no se alcanzó el objetivo ~100 s.
+- **pin_memory** subió a **~434–454 s** por paso (Fila 4: ~200 s). Con 83 capas → ~5.2 s/capa vs ~2.4 s/capa antes. El **single pinned buffer** parece más lento que el `pin_memory()` por tensor (posible peor uso de caché o coste de la copia al buffer único).
+- **Conclusión**: dual prefetch no redujo el wall time en este setup; el single buffer empeoró el tiempo de pin. Recomendación: probar **solo dual prefetch sin single buffer** (revertir `_pin_memory_single_buffer` y usar de nuevo el bucle `tensor.pin_memory()` por tensor) para ver si el dual prefetch por sí solo aporta mejora.
+
+### Fila 6 → Fila 7: dual prefetch only (sin single buffer) — resultado medido
+- **Medido**: wall **~203 s/paso** (1 paso completo). Ligera mejora vs Fila 4 (~199 s) y vs Fila 6 (~221 s).
+- **pin_memory** ~400 s por paso (con 2 hilos el profiler suma ambos; equivalente ~200 s efectivos, en línea con Fila 4).
+- **Conclusión**: Quitar el single buffer recupera tiempos de pin razonables. Dual prefetch solo da una mejora marginal (~2%) respecto a Fila 4; no se acerca al objetivo ~100 s. La configuración actual recomendada es **Fila 7** (dual prefetch + pin_memory por tensor).
+
 ---
 
-## Comando para la siguiente medición
+## Comando para reproducir (Fila 7)
 
 ```bash
 uv run python scripts/profile_inference.py \
   --model Qwen/Qwen2.5-72B-Instruct \
-  --max-new-tokens 10 \
-  --no-prefetch-pin-memory
+  --max-new-tokens 10
 ```
 
 ---
@@ -80,3 +93,5 @@ uv run python scripts/profile_inference.py \
 | Fila 3 | `create_layer_from_state_dict` sin pinned memory (~277 s/paso) |
 | Fila 4 | `pin_memory` en hilo prefetch, ahora más visible (~200 s/paso) |
 | Fila 5 (medido) | Wall 266 s vs process 162 s → ~104 s de espera (transfer CPU→GPU sin pin_memory); mantener pin_memory ON |
+| Fila 6 (medido) | Wall ~221 s. pin_memory ~434 s (single buffer empeoró) |
+| Fila 7 (medido) | Dual prefetch only: wall ~203 s (~2% mejor que 4). Configuración recomendada |
