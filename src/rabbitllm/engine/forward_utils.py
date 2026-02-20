@@ -57,6 +57,30 @@ def build_attention_mask_and_position_ids(
     return attention_mask, position_ids
 
 
+def _get_kv_from_dynamic_cache(
+    cache: Any,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Extract (k, v) from a DynamicCache using either the 5.x (.layers) or legacy (.key_cache) API.
+
+    In transformers 5.x, DynamicCache stores KV in `.layers[i].keys / .values`.
+    In older versions (< 5.x), it used `.key_cache[-1] / .value_cache[-1]`.
+    """
+    # New API: transformers 5.x
+    layers = getattr(cache, "layers", None)
+    if layers and len(layers) > 0:
+        layer0 = layers[0]
+        k = getattr(layer0, "keys", None)
+        v = getattr(layer0, "values", None)
+        if k is not None and v is not None and k.numel() > 0:
+            return k, v
+    # Legacy API: transformers < 5.x
+    key_cache = getattr(cache, "key_cache", None)
+    value_cache = getattr(cache, "value_cache", None)
+    if key_cache and value_cache and len(key_cache) > 0:
+        return key_cache[-1], value_cache[-1]
+    return None, None
+
+
 def extract_kv_from_layer_output(
     layer_out: Any,
     output_attentions: bool = False,
@@ -99,12 +123,7 @@ def extract_kv_from_layer_output(
         return hidden_states, cache_data[0], cache_data[1]
 
     if cache_utils_installed and cache_class is not None and isinstance(cache_data, cache_class):
-        if len(cache_data.key_cache) > 0:
-            return (
-                hidden_states,
-                cache_data.key_cache[-1],
-                cache_data.value_cache[-1],
-            )
-        return hidden_states, None, None
+        k, v = _get_kv_from_dynamic_cache(cache_data)
+        return hidden_states, k, v
 
     return hidden_states, None, None

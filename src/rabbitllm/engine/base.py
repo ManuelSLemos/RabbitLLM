@@ -35,6 +35,7 @@ from .attention import ATTN_FALLBACK_ORDER, resolve_attn_implementation, create_
 from .model_init import create_model_with_attn_fallback
 from . import layer_loading as layer_loading_impl
 from .forward_utils import (
+    _get_kv_from_dynamic_cache as _get_kv_from_dynamic_cache_fn,
     build_attention_mask_and_position_ids,
     extract_kv_from_layer_output as extract_kv_from_layer_output_fn,
 )
@@ -704,7 +705,10 @@ class RabbitLLMBaseModel(GenerationMixin):
                 else:
                     _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
             elif self.prefetching:
-                future = executor.submit(self.load_layer_to_cpu, self.layer_names[0])
+                # In incremental steps (small layers already on GPU), embed is skipped in the loop
+                # so start the prefetch from the first decoder layer (index 1) to stay in sync.
+                _prefetch_start = 1 if getattr(self, "_small_layers_on_gpu", False) else 0
+                future = executor.submit(self.load_layer_to_cpu, self.layer_names[_prefetch_start])
 
             layer_iter = enumerate(zip(self.layer_names, self.layers))
             if getattr(self, "show_layer_progress", True):
@@ -815,14 +819,23 @@ class RabbitLLMBaseModel(GenerationMixin):
                             }
                             with self._layer_idx_as_zero(layer):
                                 layer_outputs = layer(seq, **kwargs)
-                            new_seq = layer_outputs[0]
-                            if output_attentions:
+                            new_seq, k_cache, v_cache = self._extract_kv_from_layer_output(
+                                layer_outputs,
+                                output_attentions=output_attentions,
+                            )
+                            if output_attentions and not isinstance(layer_outputs, torch.Tensor):
                                 all_self_attns[i].append(layer_outputs[1])
                             if use_cache:
-                                _, k_cache, v_cache = self._extract_kv_from_layer_output(
-                                    layer_outputs,
-                                    output_attentions=output_attentions,
-                                )
+                                if (
+                                    k_cache is None
+                                    and cache_utils_installed
+                                    and self._uses_cache_objects
+                                ):
+                                    pkv = kwargs.get("past_key_value") or kwargs.get(
+                                        "past_key_values"
+                                    )
+                                    if isinstance(pkv, Cache):
+                                        k_cache, v_cache = _get_kv_from_dynamic_cache_fn(pkv)
                                 if k_cache is not None:
                                     kv_cache_list[i][0].append(k_cache)
                                     kv_cache_list[i][1].append(v_cache)
@@ -870,11 +883,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                                         "past_key_values"
                                     )
                                     if isinstance(pkv, Cache):
-                                        key_cache = getattr(pkv, "key_cache", None)
-                                        value_cache = getattr(pkv, "value_cache", None)
-                                        if key_cache and value_cache and len(key_cache) > 0:
-                                            k_cache = key_cache[-1]
-                                            v_cache = value_cache[-1]
+                                        k_cache, v_cache = _get_kv_from_dynamic_cache_fn(pkv)
                                 if k_cache is not None:
                                     kv_cache_list[i][0].append(k_cache)
                                     kv_cache_list[i][1].append(v_cache)
