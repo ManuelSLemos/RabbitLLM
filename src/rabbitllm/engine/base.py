@@ -65,14 +65,45 @@ except ImportError:
 class RabbitLLMBaseModel(GenerationMixin):
     """Layer-streaming causal LM: loads one layer at a time to GPU, runs forward, frees memory.
 
-    Enables running 70B+ parameter models on 4GB VRAM without quantization. Subclass and override
-    set_layer_names_dict() for architecture-specific layer naming.
+    Enables running 70B+ parameter models on 4GB VRAM without quantization, distillation, or
+    pruning. The model is split into per-layer safetensors shards on first use; during inference
+    each shard is loaded to GPU, the forward pass is run, then the shard is freed before the
+    next layer is loaded.
+
+    Inherits from ``GenerationMixin`` so standard HuggingFace ``generate()`` works directly.
+
+    Typical usage::
+
+        from rabbitllm import AutoModel
+
+        model = AutoModel.from_pretrained("meta-llama/Llama-3-8B")
+        tokens = model.tokenizer(["Hello"], return_tensors="pt")
+        output = model.generate(tokens["input_ids"].cuda(), max_new_tokens=50)
+        print(model.tokenizer.decode(output.sequences[0]))
+
+    To add support for a new architecture, subclass this class and override
+    ``set_layer_names_dict()`` with the correct layer name mapping.
     """
 
     # Required by transformers 5.x GenerationMixin for cache handling (supports DynamicCache).
     _is_stateful = False
 
-    def set_layer_names_dict(self):
+    def set_layer_names_dict(self) -> None:
+        """Set architecture-specific layer name mapping.
+
+        Override in subclasses to match the model's parameter naming convention.
+        Required keys: ``embed``, ``layer_prefix``, ``norm``, ``lm_head``.
+        Optional key: ``rotary_pos_emb`` (ChatGLM only).
+
+        Example (default — Llama-style)::
+
+            {
+                "embed":        "model.embed_tokens",
+                "layer_prefix": "model.layers",
+                "norm":         "model.norm",
+                "lm_head":      "lm_head",
+            }
+        """
         self.layer_names_dict = {
             "embed": "model.embed_tokens",
             "layer_prefix": "model.layers",

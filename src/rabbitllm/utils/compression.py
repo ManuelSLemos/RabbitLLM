@@ -99,8 +99,23 @@ def decompress_after_async_copy(tensors_on_device: dict) -> dict:
     return decompressed
 
 
-def uncompress_layer_state_dict(layer_state_dict):
-    """Dequantize 4bit/8bit layer state_dict to float16; pass-through if not compressed."""
+def uncompress_layer_state_dict(layer_state_dict: dict) -> dict:
+    """Dequantize a 4-bit or 8-bit compressed layer state_dict back to float16.
+
+    If the state_dict was not compressed (no ".4bit." or ".8bit." keys), it is returned
+    unchanged. Requires bitsandbytes and CUDA.
+
+    Args:
+        layer_state_dict: State dict produced by ``compress_layer_state_dict``, containing
+            either packed 4-bit/NF4 tensors with quant metadata or 8-bit block-quantized
+            tensors with absmax/code entries.
+
+    Returns:
+        State dict with float16 tensors (same keys as original, quant metadata removed).
+
+    Raises:
+        ImportError: If bitsandbytes is not installed.
+    """
     if not bitsandbytes_installed:
         raise ImportError(
             "bitsandbytes is required for uncompressing 4bit/8bit layers. "
@@ -144,8 +159,28 @@ def uncompress_layer_state_dict(layer_state_dict):
     )
 
 
-def compress_layer_state_dict(layer_state_dict, compression=None):
-    """Quantize layer state_dict to 4bit or 8bit (bitsandbytes); pass-through if compression None."""
+def compress_layer_state_dict(layer_state_dict: dict, compression: str | None = None) -> dict:
+    """Quantize a layer state_dict to 4-bit (NF4) or 8-bit block-wise format via bitsandbytes.
+
+    The compressed state_dict stores packed tensors alongside quant-state metadata keys
+    (e.g. ``"param.4bit.absmax"``) that are needed for dequantization. Used during the
+    split phase to reduce on-disk and in-memory size before GPU inference.
+
+    If ``compression`` is None, the state_dict is returned unchanged.
+
+    Args:
+        layer_state_dict: Mapping of parameter name → float tensor to compress.
+        compression: ``"4bit"`` for NF4 block-wise quantization (blocksize 64),
+            ``"8bit"`` for 8-bit block-wise quantization (blocksize 2048), or
+            ``None`` (default) to skip compression.
+
+    Returns:
+        State dict with packed integer tensors and quant metadata, or the original dict
+        if ``compression`` is None.
+
+    Raises:
+        ImportError: If ``compression`` is set and bitsandbytes is not installed.
+    """
     if compression and not bitsandbytes_installed:
         raise ImportError(
             "bitsandbytes is required for compression. Install with: pip install bitsandbytes"

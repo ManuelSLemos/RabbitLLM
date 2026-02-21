@@ -1190,7 +1190,7 @@ wheels = [
 
 [[package]]
 name = "rabbitllm"
-version = "2.11.0"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
@@ -1245,7 +1245,7 @@ requires-dist = [
     { name = "tiktoken", specifier = ">=0.12.0" },
     { name = "torch", specifier = ">=2.5,<2.6" },
     { name = "tqdm" },
-    { name = "transformers", specifier = ">=5.0,<5.1" },
+    { name = "transformers", specifier = ">=5.0,<5.3" },
     { name = "transformers-stream-generator", specifier = ">=0.0.5" },
 ]
 provides-extras = ["compression", "flash", "server", "dev"]

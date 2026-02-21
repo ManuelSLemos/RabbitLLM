@@ -10,14 +10,14 @@ from rabbitllm import AutoModel
 # editing the script.  Sensible defaults for a 32 GB / 8 GB VRAM laptop.
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="RabbitLLM inference example")
-parser.add_argument("--model", default="Qwen/Qwen2.5-72B-Instruct",
+parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct",
                     help="HuggingFace repo ID or local path")
 parser.add_argument("--compression", default="4bit", choices=["4bit", "8bit", "none"],
                     help="Weight compression. Default: 4bit (recommended for 72B on ≤32 GB RAM). "
                          "bfloat16 (none) needs ~195 s/token and risks thermal shutdown on laptops.")
-parser.add_argument("--max-new-tokens", type=int, default=10,
+parser.add_argument("--max-new-tokens", type=int, default=50,
                     help="Tokens to generate. Keep small (≤10) for quick tests on 72B. "
-                         "Default: 10 (~10 min with 4-bit, ~33 min with bfloat16).")
+                         "Default: 50 (~10 min with 4-bit, ~33 min with bfloat16).")
 parser.add_argument("--cache-layers", type=int, default=None,
                     help="CPU RAM layer cache size (number of layers). "
                          "Speeds up decode by skipping repeated disk reads. "

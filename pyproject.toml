@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rabbitllm"
-version = "2.11.0"
-description = "RabbitLLM allows single 4GB GPU card to run 70B large language models without quantization, distillation or pruning. 8GB vmem to run 405B Llama3.1."
+version = "1.0.0"
+description = "Run 70B+ LLMs on a single 4GB GPU — no quantization required. Layer-streaming inference for consumer hardware."
 readme = "README.md"
 license = "MIT"
 authors = [
@@ -16,7 +16,7 @@ requires-python = ">=3.10"
 dependencies = [
     "tqdm",
     "torch>=2.5,<2.6",
-    "transformers>=5.0,<5.1",
+    "transformers>=5.0,<5.3",
     "accelerate>=1.1.0",
     "safetensors>=0.4",
     "huggingface-hub>=0.20",

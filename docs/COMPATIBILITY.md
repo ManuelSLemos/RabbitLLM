@@ -2,10 +2,10 @@
 
 ## Transformers version
 
-- **Supported**: `transformers>=5.0,<5.1` (5.0.x only).
-- **Versiones superiores (5.1.x / 5.2.x y posteriores)**:
-  - **RoPE 14 vs 64**: Con Qwen2/Qwen2.5 en layer-streaming aparece un error en el forward incremental (segundo forward con `past_key_values`): `RuntimeError: The size of tensor a (14) must match the size of tensor b (64) at non-singleton dimension 3` en `apply_rotary_pos_emb` (q * cos). Causa: `head_dim` incorrecto en la atención. **Solución pendiente**; usar 5.0.x para Qwen2/Qwen2.5 hasta resolverlo.
-  - **KV cache**: En 4.47+ las capas decoder de Qwen2 (y similares) no devuelven el cache en la tupla; lo actualizan in-place en el `DynamicCache`. El motor usa un fallback leyendo del objeto cache (`.layers[0].keys`/`.values` o legacy `.key_cache`/`.value_cache`) y debe pasar `cache_position` 1D y el mismo objeto que luego se lee. Al subir a 5.1+, **revisar** que la API de Cache (DynamicCache, `.layers`, etc.) no haya cambiado y que el KV cache en layer-streaming siga rellenándose; si vuelve el aviso "KV cache was not filled", revalidar fallback y kwargs del primer/incremental forward. Ver [TROUBLESHOOTING.md](TROUBLESHOOTING.md#kv-cache-not-filled--no-incremental-decoding).
+- **Supported**: `transformers>=5.0,<5.3` (5.0.x–5.2.x).
+- **Qwen2/Qwen2.5 with transformers 5.1+**:
+  - **RoPE 14 vs 64**: In layer-streaming with Qwen2/Qwen2.5 there may be an error on incremental forward (second forward with `past_key_values`): `RuntimeError: The size of tensor a (14) must match the size of tensor b (64) at non-singleton dimension 3` in `apply_rotary_pos_emb`. Cause: incorrect `head_dim` in attention. **Workaround**: use transformers 5.0.x for Qwen2/Qwen2.5; other architectures work fine on 5.1+.
+  - **KV cache**: In 5.0+ decoder layers for Qwen2 and similar do not return the cache in the output tuple; they update `DynamicCache` in-place. The engine uses a fallback reading from the cache object (`.layers[0].keys`/`.values` or legacy `.key_cache`/`.value_cache`) and passes `cache_position` and the same object for reading. On 5.1+, if the "KV cache was not filled" warning appears, re-validate the DynamicCache API and the fallback. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#kv-cache-not-filled--no-incremental-decoding).
 
 The codebase uses `GenerationMixin` from `transformers.generation.utils` (with fallback from `transformers`) and `Cache`/`DynamicCache` from `transformers.cache_utils`.
 
