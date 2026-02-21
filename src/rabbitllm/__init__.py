@@ -17,6 +17,7 @@ else:
     from .models.chatglm import RabbitLLMChatGLM
     from .models.qwen import RabbitLLMQWen
     from .models.qwen2 import RabbitLLMQWen2
+    from .models.qwen3 import RabbitLLMQWen3
     from .models.baichuan import RabbitLLMBaichuan
     from .models.internlm import RabbitLLMInternLM
     from .models.mistral import RabbitLLMMistral

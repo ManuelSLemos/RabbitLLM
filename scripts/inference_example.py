@@ -24,6 +24,15 @@ parser.add_argument("--cache-layers", type=int, default=None,
                          "Suggested: 30 for 4-bit 72B on 32 GB RAM.")
 parser.add_argument("--prompt", default="What is the capital of France?",
                     help="User message to send to the model.")
+parser.add_argument("--no-think", action="store_true",
+                    help="Disable Qwen3 chain-of-thought thinking mode (adds /no_think system prompt).")
+parser.add_argument("--do-sample", action="store_true",
+                    help="Use sampling instead of greedy decoding. Recommended for thinking models "
+                         "to avoid repetition loops.")
+parser.add_argument("--temperature", type=float, default=0.6,
+                    help="Sampling temperature (only used with --do-sample). Default: 0.6.")
+parser.add_argument("--top-p", type=float, default=0.95,
+                    help="Top-p nucleus sampling (only used with --do-sample). Default: 0.95.")
 args = parser.parse_args()
 
 compression = None if args.compression == "none" else args.compression
@@ -47,9 +56,9 @@ model = AutoModel.from_pretrained(
 load_s = time.perf_counter() - t0
 print(f"[time] model load: {load_s:.2f}s")
 
-# Qwen2.5-Instruct models require the ChatML template format
+system_content = "/no_think" if args.no_think else "You are a helpful assistant."
 messages = [
-    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "system", "content": system_content},
     {"role": "user", "content": args.prompt},
 ]
 
@@ -71,14 +80,18 @@ else:
     attention_mask = attention_mask.to(device)
 
 t1 = time.perf_counter()
-generation_output = model.generate(
-    input_ids,
+generate_kwargs = dict(
     attention_mask=attention_mask,
     max_new_tokens=args.max_new_tokens,
     use_cache=True,
-    do_sample=False,
+    do_sample=args.do_sample,
     return_dict_in_generate=True,
 )
+if args.do_sample:
+    generate_kwargs["temperature"] = args.temperature
+    generate_kwargs["top_p"] = args.top_p
+
+generation_output = model.generate(input_ids, **generate_kwargs)
 gen_s = time.perf_counter() - t1
 
 input_len = input_tokens["input_ids"].shape[1]

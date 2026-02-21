@@ -237,19 +237,9 @@ class RabbitLLMBaseModel(GenerationMixin):
         else:
             self.config = AutoConfig.from_pretrained(self.model_local_path, trust_remote_code=True)
 
-        # Set config.head_dim to canonical (hidden_size // num_attention_heads) so that
-        # Qwen2 and similar use the correct RoPE/attention dimension. Some configs omit
-        # head_dim or set it wrongly (e.g. to num_attention_heads).
-        if hasattr(self.config, "hidden_size") and hasattr(self.config, "num_attention_heads"):
-            canonical_hd = self.config.hidden_size // self.config.num_attention_heads
-            current_hd = getattr(self.config, "head_dim", None)
-            if current_hd != canonical_hd:
-                self.config.head_dim = canonical_hd
-                if current_hd is not None:
-                    logger.info(
-                        "Set config.head_dim from %s to canonical %s (hidden_size // num_attention_heads)",
-                        current_hd, canonical_hd,
-                    )
+        # Allow subclasses to adjust config before the model skeleton is created
+        # (e.g. Qwen2 corrects head_dim for a transformers 5.2 bug).
+        self._prepare_config_for_skeleton()
 
         # Resolve dtype: user-specified > model config > float16 fallback
         if dtype is None:
@@ -343,11 +333,9 @@ class RabbitLLMBaseModel(GenerationMixin):
     def init_model(self):
         self.model = None
 
-        # Ensure head_dim is canonical before creating the model (every time, including after _reset_model).
-        if hasattr(self.config, "hidden_size") and hasattr(self.config, "num_attention_heads"):
-            canonical_hd = self.config.hidden_size // self.config.num_attention_heads
-            if getattr(self.config, "head_dim", None) != canonical_hd:
-                self.config.head_dim = canonical_hd
+        # Allow subclasses to adjust config before skeleton creation (called every time,
+        # including after _reset_model, so the config stays consistent across reinits).
+        self._prepare_config_for_skeleton()
 
         if hasattr(self, "_active_attn_implementation"):
             try:
@@ -371,24 +359,8 @@ class RabbitLLMBaseModel(GenerationMixin):
             self._active_attn_implementation = "eager"
             logger.info("Model initialized with default (eager) attention")
 
-        # Sanity check for Qwen2-like models: decoder attention head_dim must be canonical
-        if hasattr(self.config, "hidden_size") and hasattr(self.config, "num_attention_heads"):
-            canonical_hd = self.config.hidden_size // self.config.num_attention_heads
-            model_attr = self.model
-            for attr_name in self.layer_names_dict.get("layer_prefix", "model.layers").split("."):
-                model_attr = getattr(model_attr, attr_name, None)
-                if model_attr is None:
-                    break
-            if model_attr is not None and len(model_attr) > 0:
-                first_attn = getattr(model_attr[0], "self_attn", None)
-                if first_attn is not None:
-                    layer_hd = getattr(first_attn, "head_dim", None)
-                    if layer_hd is not None and layer_hd != canonical_hd:
-                        # Force on the actual model modules so forward sees correct head_dim
-                        for layer in model_attr:
-                            attn = getattr(layer, "self_attn", None)
-                            if attn is not None:
-                                attn.head_dim = canonical_hd
+        # Allow subclasses to fix attention head_dim on the fresh skeleton.
+        self._fix_attention_head_dim()
 
         quantization_config = getattr(self.config, "quantization_config", None)
 
@@ -416,27 +388,29 @@ class RabbitLLMBaseModel(GenerationMixin):
             # for glm keep rotary_pos_emb in gpu
             self.load_rotary_pos_emb_to_device()
 
-    def _fix_attention_head_dim(self):
-        """Force canonical head_dim on all decoder attention modules (e.g. Qwen2 14 vs 64)."""
-        if not hasattr(self.config, "hidden_size") or not hasattr(self.config, "num_attention_heads"):
-            return
-        canonical = self.config.hidden_size // self.config.num_attention_heads
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["layer_prefix"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        for layer in model_attr:
-            attn = getattr(layer, "self_attn", None)
-            if attn is not None and getattr(attn, "head_dim", None) != canonical:
-                attn.head_dim = canonical
+    def _prepare_config_for_skeleton(self) -> None:
+        """Hook: adjust ``self.config`` before the model skeleton is created.
 
-    def _fix_layer_attention_head_dim(self, layer):
-        """Force canonical head_dim on a single decoder layer's attention (e.g. after loading its weights)."""
-        if not hasattr(self.config, "hidden_size") or not hasattr(self.config, "num_attention_heads"):
-            return
-        canonical = self.config.hidden_size // self.config.num_attention_heads
-        attn = getattr(layer, "self_attn", None)
-        if attn is not None and getattr(attn, "head_dim", None) != canonical:
-            attn.head_dim = canonical
+        Called from both ``__init__`` and ``init_model`` (which is also called by
+        ``_reset_model``).  Override in subclasses to correct config attributes that
+        affect the skeleton shape (e.g. Qwen2 corrects ``head_dim`` for a
+        transformers 5.2 bug).  The base implementation is a no-op.
+        """
+
+    def _fix_attention_head_dim(self) -> None:
+        """Hook: fix ``head_dim`` on the model skeleton after it is created.
+
+        Called from ``init_model`` immediately after the skeleton is built.
+        Override in subclasses that need to patch Python-level attributes on the
+        attention modules (e.g. Qwen2).  The base implementation is a no-op.
+        """
+
+    def _fix_layer_attention_head_dim(self, layer) -> None:
+        """Hook: fix ``head_dim`` on a single decoder layer after its weights are loaded.
+
+        Called from the layer-streaming loop each time a decoder layer is moved to
+        the device.  Override in subclasses (e.g. Qwen2).  Base is a no-op.
+        """
 
     def set_layers_from_layer_names(self):
 
@@ -926,11 +900,12 @@ class RabbitLLMBaseModel(GenerationMixin):
                                 attention_mask, len_p, len_s
                             )
                             past_key_value_args = self._make_layer_past_kv_arg(k_cache, v_cache)
-                            pos_emb = (
-                                {"position_embeddings": self._position_embeddings_cache}
-                                if self._position_embeddings_cache is not None
-                                else self.get_pos_emb_args(len_p, len_s, layer=layer)
-                            )
+                            # During decode the position is len_p (past tokens), not 0.
+                            # Never reuse _position_embeddings_cache here — it was computed for
+                            # the prefill sequence starting at position 0 and would produce wrong
+                            # RoPE values for all subsequent tokens (visible as multilingual garbage
+                            # in models with per-head q_norm/k_norm like Qwen3).
+                            pos_emb = self.get_pos_emb_args(len_p, len_s, layer=layer)
                             # cache_position required by transformers 5.x for Flash/SDPA incremental
                             cache_position = position_ids[:, len_p : len_p + len_s]
                             kwargs = {

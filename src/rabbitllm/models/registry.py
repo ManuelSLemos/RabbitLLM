@@ -54,7 +54,7 @@ class AutoModel:
         if "Qwen2ForCausalLM" in arch or "Qwen2.5" in arch:
             return "rabbitllm.models.qwen2", "RabbitLLMQWen2"
         if "Qwen3" in arch:
-            return "rabbitllm.models.qwen2", "RabbitLLMQWen2"
+            return "rabbitllm.models.qwen3", "RabbitLLMQWen3"
         if "QWen" in arch:
             return "rabbitllm.models.qwen", "RabbitLLMQWen"
         if "Baichuan" in arch:
