@@ -35,6 +35,11 @@ def main():
                         help="Disable pin_memory in prefetch (recommended for 70B/72B to reduce total time)")
     parser.add_argument("--compression", default=None, choices=["4bit", "8bit"],
                         help="Load 4-bit or 8-bit quantized split (requires prior split_and_save_layers with same compression)")
+    parser.add_argument("--cache-layers", type=int, default=None,
+                        help="Keep N layer state-dicts in CPU RAM between forward passes. "
+                             "Cache hits skip disk I/O; pin_memory runs on already-in-RAM tensors "
+                             "(RAM→pinned copy ~0.017 s/layer vs disk+pin ~0.67 s/layer). "
+                             "Suggested: 30 for 4-bit 72B on 32 GB RAM.")
     parser.add_argument("--token", default=None, help="HuggingFace token for gated repos")
     args = parser.parse_args()
 
@@ -51,6 +56,7 @@ def main():
         attn_implementation=args.attn_implementation,
         prefetch_pin_memory=not args.no_prefetch_pin_memory,
         compression=args.compression,
+        cache_layers=args.cache_layers,
         token=args.token,
     )
     load_sec = time.perf_counter() - load_start

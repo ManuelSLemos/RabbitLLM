@@ -18,6 +18,7 @@ Métricas: acumuladas por paso de generación (suma de 83 capas). Wall time en s
 | 6 | Flash ON · async ON · pin_memory ON · **dual prefetch** · single pinned buffer | ~434–454 | ~9.5–13 | ~0.21 | ~29–35 | **~219–223** | — (interrumpido) | 2 pasos medidos |
 | 7 | Flash ON · async ON · pin_memory ON · **dual prefetch only** (sin single buffer) | ~400 | ~8.2 | ~0.21 | ~32 | **~203** ✅ | — (interrumpido) | 1 paso completo |
 | 8 | Fila 7 + **fix decode** (lm_head excluido de GPU persistente) | ~376–381 | **~4–6** ✅ | ~0.4 prefill / **~0** decode ✅ | ~30–32 | **~194–196** ✅ | **~1755** est. | 3 tokens medidos (prefill + 2 decode sin OOM) |
+| 9 | Fila 8 + **4-bit NF4** (async decompression en Phase B) | ~92–130 | **~1.3** ✅ | ~0.18 prefill / **~0** decode ✅ | ~19–23 | **~51–72** ✅ | **~560** ✅ | 10 tokens medidos · 3.5× vs Fila 8 |
 
 > `create_layer` en la fila 4 solo registra layer 0 (las restantes 82 capas van por async y no se miden en ese contador). En fila 5, `create_layer` ~3 s (83 capas en async, sin pin_memory).
 
@@ -34,6 +35,7 @@ pin_mem OFF (5):  ████████████████████�
 dual prefetch (6): ████████████████████████  ~221 s   (+11% vs 4 — single buffer empeoró)
 dual prefetch only (7): ███████████████████████  ~203 s   (~2% mejor que 4; sin single buffer)
 fix decode (8):   ██████████████████████  ~195 s   (prefill=195 decode=195 ✅ primer decode funcional)
+4-bit async (9):  ██████  ~56 s   (3.5× más rápido que Fila 8 · pin_memory 50s efectivos)
 ```
 
 ---
@@ -105,3 +107,4 @@ uv run python scripts/profile_inference.py \
 | Fila 6 (medido) | Wall ~221 s. pin_memory ~434 s (single buffer empeoró) |
 | Fila 7 (medido) | Dual prefetch only: wall ~203 s (~2% mejor que 4). Decode crasheaba por OOM |
 | Fila 8 (medido) | Fix decode: wall ~195 s prefill y **~195 s decode** ✅. cpu_wait decode ~5 s. Configuración recomendada |
+| Fila 9 (medido) | 4-bit NF4 + async decompression: wall **~56 s/paso** ✅. 3.5× vs Fila 8. pin_memory ~50 s efectivos (datos 3.5× menores). Nuevo cuello de botella: ~50 s I/O de pin + ~20 s forward |

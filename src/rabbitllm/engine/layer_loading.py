@@ -22,6 +22,8 @@ def load_layer_to_cpu(
     persister: Optional[Any] = None,
     use_pin_memory: bool = True,
     decompress: bool = True,
+    layer_cpu_cache: Optional[dict] = None,
+    cache_layers_limit: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Load a layer's state_dict from checkpoint to CPU, optionally with pin_memory for prefetch.
 
@@ -52,20 +54,41 @@ def load_layer_to_cpu(
     dict
         state_dict for the layer (CPU tensors, possibly compressed when decompress=False).
     """
-    t = time.time()
-    load_layer_output = load_layer(
-        checkpoint_path, layer_name, profiling_mode, persister=persister, decompress=decompress
-    )
-    elapsed_time = time.time() - t
+    cache_hit = layer_cpu_cache is not None and layer_name in layer_cpu_cache
 
-    if profiling_mode:
-        state_dict, compression_time = load_layer_output
-        disk_loading_time = elapsed_time - compression_time
-        if profiler is not None:
-            profiler.add_profiling_time("load_safe_tensor", disk_loading_time)
-            profiler.add_profiling_time("compression_time", compression_time)
+    if cache_hit:
+        # Layer is already in RAM: reuse cached tensors, skip disk I/O entirely.
+        # We still need to make fresh copies because pin_memory() allocates new
+        # page-locked buffers — we cannot pin the cached tensors in-place (they
+        # must stay unpinned in the cache for the next token to reuse).
+        state_dict = {k: v.clone() for k, v in layer_cpu_cache[layer_name].items()}
+        if profiling_mode and profiler is not None:
+            profiler.add_profiling_time("load_safe_tensor", 0.0)
+            profiler.add_profiling_time("compression_time", 0.0)
     else:
-        state_dict = load_layer_output
+        t = time.time()
+        load_layer_output = load_layer(
+            checkpoint_path, layer_name, profiling_mode, persister=persister, decompress=decompress
+        )
+        elapsed_time = time.time() - t
+
+        if profiling_mode:
+            state_dict, compression_time = load_layer_output
+            disk_loading_time = elapsed_time - compression_time
+            if profiler is not None:
+                profiler.add_profiling_time("load_safe_tensor", disk_loading_time)
+                profiler.add_profiling_time("compression_time", compression_time)
+        else:
+            state_dict = load_layer_output
+
+        # Populate cache if enabled and there is room.
+        if (
+            layer_cpu_cache is not None
+            and (cache_layers_limit is None or len(layer_cpu_cache) < cache_layers_limit)
+        ):
+            # Store unpin'd CPU copies so they can be reused cheaply next token.
+            layer_cpu_cache[layer_name] = {k: v.clone() for k, v in state_dict.items()
+                                           if v.device.type == "cpu"}
 
     if prefetching and use_pin_memory:
         t = time.time()

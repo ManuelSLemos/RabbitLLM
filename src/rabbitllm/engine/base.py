@@ -97,6 +97,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         attn_implementation: str = "auto",
         persister: Optional[Any] = None,
         show_layer_progress: bool = True,
+        cache_layers: Optional[int] = None,
     ) -> None:
         """Initialize the layer-streaming model from a checkpoint or HuggingFace repo.
 
@@ -124,6 +125,16 @@ class RabbitLLMBaseModel(GenerationMixin):
                 otherwise SDPA. No need to configure manually on supported hardware.
             persister: Optional ModelPersister for layer I/O; default from get_model_persister().
             show_layer_progress: If True, show tqdm progress over layers during forward.
+            cache_layers: Number of layers to keep in CPU RAM between forward passes.
+                On the first pass each layer is loaded from disk and cached (uncompressed or
+                compressed depending on the async-decompress path).  On subsequent passes the
+                cached tensors are reused, so only ``pin_memory`` is repeated (a RAM→pinned
+                copy at full memory bandwidth, ~0.017 s/layer) instead of the full
+                disk-read+pin cycle (~0.67 s/layer).  The cache is bounded: once
+                ``cache_layers`` slots are full, new entries are not added (LRU eviction is
+                NOT performed — oldest entries stay).  Set to the number of layers that fit
+                in your available RAM budget (e.g. 30 for a 32 GB machine with 4-bit weights).
+                Pass ``None`` (default) to disable caching.
         """
 
         self.profiling_mode = profiling_mode
@@ -136,6 +147,12 @@ class RabbitLLMBaseModel(GenerationMixin):
         self.hf_quantizer = None
         self.attn_implementation = attn_implementation
         self._warned_no_kv_cache = False
+
+        # CPU layer cache: keeps up to cache_layers state_dicts in RAM between forward passes.
+        # Reusing cached tensors skips disk I/O so pin_memory only pays a fast RAM→pinned
+        # copy (~0.017 s/layer) instead of disk-page-fault+pin (~0.67 s/layer).
+        self._cache_layers_limit: Optional[int] = cache_layers
+        self._layer_cpu_cache: dict = {}  # {layer_name: state_dict (unpin'd CPU tensors)}
 
         if compression is not None:
             if not bitsandbytes_installed:
@@ -433,7 +450,18 @@ class RabbitLLMBaseModel(GenerationMixin):
             persister=self._persister,
             use_pin_memory=self.prefetch_pin_memory,
             decompress=decompress,
+            layer_cpu_cache=self._layer_cpu_cache if self._cache_layers_limit is not None else None,
+            cache_layers_limit=self._cache_layers_limit,
         )
+
+    def clear_layer_cache(self) -> None:
+        """Clear the CPU layer cache, freeing the RAM it occupies.
+
+        Call this to release memory between independent inference sessions, or when
+        switching to a different input that would invalidate cached weights.
+        The cache is populated automatically on the next forward pass.
+        """
+        self._layer_cpu_cache.clear()
 
     def move_layer_to_device(self, state_dict):
         return layer_loading_impl.move_layer_to_device(
@@ -646,14 +674,20 @@ class RabbitLLMBaseModel(GenerationMixin):
         n_layers = len(self.layer_names)
         # Layers that stay on GPU between decode tokens (skip_meta=True) and are
         # treated as "already loaded" during the decode loop (state_dict = {}).
-        # lm_head is intentionally EXCLUDED: on large models (e.g. 72B) it can be
-        # ~2.32 GiB, which — if kept on GPU — leaves no room for the 2-layer async
-        # GPU copy pipeline during decode.  It is instead loaded by the async pipeline
-        # (Phase A of the last decoder layer), overlapping with compute.
+        #
+        # lm_head handling:
+        # • tie_word_embeddings=True  → lm_head shares storage with embed_tokens (same GPU
+        #   tensor, zero extra VRAM).  It MUST stay on GPU; moving it to meta breaks the
+        #   weight tie and causes garbage output.
+        # • tie_word_embeddings=False → lm_head is a separate ~2.32 GiB tensor on large
+        #   models (e.g. 72B).  Keeping it on GPU crowds out the 2-layer async copy pipeline
+        #   and causes OOM.  It is excluded and reloaded each token via the async pipeline
+        #   (Phase A of the last decoder layer), fully overlapping with compute.
+        _tie_weights = getattr(self.config, "tie_word_embeddings", False)
         small_layer_names = (
             self.layer_names_dict["embed"],
             self.layer_names_dict["norm"],
-        )
+        ) + ((self.layer_names_dict["lm_head"],) if _tie_weights else ())
         # Async transfer: copy of layer i+1 starts BEFORE forward of layer i so they overlap.
         # Set to False to fall back to sync prefetch (CPU background load only).
         # See docs/TROUBLESHOOTING.md "Async CPU→GPU transfer".
