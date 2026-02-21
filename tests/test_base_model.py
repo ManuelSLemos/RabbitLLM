@@ -250,7 +250,7 @@ class TestAutoModel(unittest.TestCase):
     def test_get_module_class_qwen3(self):
         with patch(_PATCH_TARGET, return_value=self._mock_arch("Qwen3ForCausalLM")):
             _, cls = AutoModel.get_module_class("fake/qwen3-model")
-        assert cls == "RabbitLLMQWen2"
+        assert cls == "RabbitLLMQWen3"
 
     def test_get_module_class_gemma(self):
         with patch(_PATCH_TARGET, return_value=self._mock_arch("Gemma2ForCausalLM")):

@@ -11,7 +11,7 @@ license = "MIT"
 authors = [
     { name = "Manuel S. Lemos", email = "im@manuelslemos.es" }
 ]
-urls = { Homepage = "https://github.com/lyogavin/rabbitllm" }
+urls = { Homepage = "https://github.com/ManuelSLemos/RabbitLLM" }
 requires-python = ">=3.10"
 dependencies = [
     "tqdm",
