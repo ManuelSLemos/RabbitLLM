@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rabbitllm"
+version = "1.0.0"
+description = "Run 70B+ LLMs on a single 4GB GPU — no quantization required. Layer-streaming inference for consumer hardware."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Manuel S. Lemos", email = "im@manuelslemos.es" }
+]
+urls = { Homepage = "https://github.com/ManuelSLemos/RabbitLLM" }
+requires-python = ">=3.10"
+dependencies = [
+    "tqdm",
+    "torch>=2.5,<2.6",
+    "transformers>=5.0,<5.3",
+    "accelerate>=1.1.0",
+    "safetensors>=0.4",
+    "huggingface-hub>=0.20",
+    "scipy",
+    "transformers-stream-generator>=0.0.5",
+    "tiktoken>=0.12.0",
+    "einops>=0.8.2",
+    "sentencepiece>=0.1.99",
+    "bitsandbytes>=0.49.2",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+compression = ["bitsandbytes"]
+flash = ["flash-attn>=2.5"]
+server = []
+dev = ["ruff", "pytest", "pytest-cov", "mypy"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rabbitllm"]
+
+# flash-attn needs torch at build time when built from source (no prebuilt wheel)
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

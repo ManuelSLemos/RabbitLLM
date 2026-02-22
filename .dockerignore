@@ -1,0 +1,33 @@
+# Git and IDE
+.git
+.gitignore
+.cursor
+*.md
+!README.md
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.venv
+venv
+env
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+.eggs
+
+# Cache and local data
+.cache
+*.lock
+uv.lock
+
+# Docs/plans (optional; uncomment to keep in image)
+# .cursor/plans
+# docs
+# PLAN.md
+
+# Tests (keep if you want to run tests in container)
+# src/tests
