@@ -1,5 +1,7 @@
 # RabbitLLM
 
+![RabbitLLM logo](assets/logo-rabbitllm.jpg)
+
 **Run 70B+ LLMs on a single 4GB GPU — no quantization required.**
 
 [![PyPI](https://img.shields.io/pypi/v/rabbitllm?color=blue)](https://pypi.org/project/rabbitllm/)
@@ -7,9 +9,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![CI](https://github.com/manuelslemos/rabbitllm/actions/workflows/ci.yml/badge.svg)](https://github.com/manuelslemos/rabbitllm/actions)
 
-RabbitLLM enables inference on large language models (70B+ parameters) on consumer GPUs with as
-little as 4GB VRAM by streaming model layers one at a time through GPU memory. No quantization,
-distillation, or pruning needed — full model quality.
+RabbitLLM is a **fork of [AirLLM](https://github.com/airllm/airllm)**. It enables inference on large language models (70B+ parameters) on consumer GPUs with as little as 4GB VRAM by streaming model layers one at a time through GPU memory. No quantization, distillation, or pruning needed — full model quality.
+
+### Compatibility (current status)
+
+- **Tested and supported:** only **Qwen2** and **Qwen3** are currently tested and compatible. Use these families for reliable results.
+- **Other architectures** (Llama, Mistral, Mixtral, etc.) are present in the codebase but **not yet compatible** — use at your own risk.
+- **Apple (macOS / Apple Silicon)** is **not supported**; run on Linux or Windows with a CUDA-capable GPU (or CPU fallback on x86/ARM Linux).
 
 ## How it works
 
@@ -42,7 +48,7 @@ If the prebuilt wheel is unavailable for your setup, install from
 ```python
 from rabbitllm import AutoModel
 
-model = AutoModel.from_pretrained("meta-llama/Llama-3-8B")
+model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")  # or any Qwen2 / Qwen3
 
 input_tokens = model.tokenizer(
     ["What is the capital of France?"],
@@ -68,19 +74,21 @@ no need to pick the right class manually.
 
 ## Supported models
 
-| Family | Architectures | Class |
-|---|---|---|
-| Llama 2 / 3 / 3.1 / 3.2 | `LlamaForCausalLM` | `RabbitLLMLlama2` |
-| Qwen2 / Qwen2.5 / Qwen3 | `Qwen2ForCausalLM`, `Qwen3ForCausalLM` | `RabbitLLMQWen2` |
-| Qwen v1 | `QWenLMHeadModel` | `RabbitLLMQWen` |
-| Mistral | `MistralForCausalLM` | `RabbitLLMMistral` |
-| Mixtral | `MixtralForCausalLM` | `RabbitLLMMixtral` |
-| InternLM | `InternLMForCausalLM` | `RabbitLLMInternLM` |
-| ChatGLM | `ChatGLMModel` | `RabbitLLMChatGLM` |
-| Baichuan | `BaichuanForCausalLM` | `RabbitLLMBaichuan` |
-| Gemma 2 / 3 | `Gemma2ForCausalLM`, `Gemma3ForCausalLM` | `RabbitLLMLlama2` |
-| DeepSeek V2 / V3 | `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM` | `RabbitLLMLlama2` |
-| Phi 2 / 3 / 4 | `Phi3ForCausalLM`, `Phi4ForCausalLM` | `RabbitLLMLlama2` |
+**Only Qwen2 and Qwen3 are tested and supported.** The following table lists the architectures present in the codebase; others are not yet compatible.
+
+| Family | Architectures | Class | Status |
+|---|---|---|---|
+| **Qwen2 / Qwen2.5 / Qwen3** | `Qwen2ForCausalLM`, `Qwen3ForCausalLM` | `RabbitLLMQWen2` | **Tested, supported** |
+| Llama 2 / 3 / 3.1 / 3.2 | `LlamaForCausalLM` | `RabbitLLMLlama2` | Not yet compatible |
+| Qwen v1 | `QWenLMHeadModel` | `RabbitLLMQWen` | Not yet compatible |
+| Mistral | `MistralForCausalLM` | `RabbitLLMMistral` | Not yet compatible |
+| Mixtral | `MixtralForCausalLM` | `RabbitLLMMixtral` | Not yet compatible |
+| InternLM | `InternLMForCausalLM` | `RabbitLLMInternLM` | Not yet compatible |
+| ChatGLM | `ChatGLMModel` | `RabbitLLMChatGLM` | Not yet compatible |
+| Baichuan | `BaichuanForCausalLM` | `RabbitLLMBaichuan` | Not yet compatible |
+| Gemma 2 / 3 | `Gemma2ForCausalLM`, `Gemma3ForCausalLM` | `RabbitLLMLlama2` | Not yet compatible |
+| DeepSeek V2 / V3 | `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM` | `RabbitLLMLlama2` | Not yet compatible |
+| Phi 2 / 3 / 4 | `Phi3ForCausalLM`, `Phi4ForCausalLM` | `RabbitLLMLlama2` | Not yet compatible |
 
 Unknown architectures fall back to the Llama-based implementation with a warning.
 
@@ -109,7 +117,7 @@ Block-wise quantization reduces on-disk and in-memory layer size:
 - **8-bit**: ~50% of original size.
 
 ```python
-model = AutoModel.from_pretrained("mistralai/Mistral-7B-v0.1", compression="4bit")
+model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", compression="4bit")
 ```
 
 Requires `bitsandbytes`: `pip install bitsandbytes`.
@@ -119,7 +127,7 @@ Requires `bitsandbytes`: `pip install bitsandbytes`.
 Pass a HuggingFace token for repos that require access approval:
 
 ```python
-model = AutoModel.from_pretrained("meta-llama/Llama-2-7b-hf", token="hf_YOUR_TOKEN")
+model = AutoModel.from_pretrained("Qwen/Qwen2.5-7B-Instruct", token="hf_YOUR_TOKEN")
 ```
 
 Or set the `HF_TOKEN` environment variable.
@@ -134,16 +142,6 @@ export HF_HOME="$(pwd)/models"
 
 The `models/` directory is in `.gitignore`. RabbitLLM will store split layers alongside
 the HuggingFace cache.
-
-## macOS / Apple Silicon
-
-Install and run the same way. Requires [mlx](https://github.com/ml-explore/mlx) and PyTorch.
-Only Apple Silicon is supported.
-
-```bash
-pip install mlx torch
-python -c "from rabbitllm import AutoModel; model = AutoModel.from_pretrained('TinyLlama/TinyLlama-1.1B-Chat-v1.0')"
-```
 
 ## Documentation
 
