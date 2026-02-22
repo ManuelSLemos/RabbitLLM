@@ -40,6 +40,7 @@ server = []
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rabbitllm"]
+include = ["src/rabbitllm/**"]
 
 # flash-attn needs torch at build time when built from source (no prebuilt wheel)
 [tool.uv.extra-build-dependencies]
