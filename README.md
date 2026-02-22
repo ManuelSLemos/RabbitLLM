@@ -47,27 +47,54 @@ If the prebuilt wheel is unavailable for your setup, install from
 ## Quickstart
 
 ```python
+import warnings
+import torch
 from rabbitllm import AutoModel
 
-model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")  # or any Qwen2 / Qwen3
+# Use GPU if available, otherwise CPU
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", message=".*CUDA.*unknown error.*", category=UserWarning)
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-input_tokens = model.tokenizer(
-    ["What is the capital of France?"],
-    return_tensors="pt",
-    return_attention_mask=False,
-    truncation=True,
-    max_length=128,
-    padding=False,
+# compression: "4bit" (recommended), "8bit", or None (bfloat16)
+model = AutoModel.from_pretrained(
+    "Qwen/Qwen2.5-0.5B-Instruct",
+    device=device,
+    compression="4bit",
 )
 
+messages = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user",   "content": "What is the capital of France?"},
+]
+
+input_text = model.tokenizer.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True
+)
+tokens = model.tokenizer(
+    [input_text], return_tensors="pt", truncation=True, max_length=512
+)
+input_ids = tokens["input_ids"].to(device)
+attention_mask = tokens.get("attention_mask")
+if attention_mask is None:
+    attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
+else:
+    attention_mask = attention_mask.to(device)
+
 output = model.generate(
-    input_tokens["input_ids"].cuda(),
-    max_new_tokens=50,
+    input_ids,
+    attention_mask=attention_mask,
+    max_new_tokens=200,
     use_cache=True,
+    do_sample=True,
+    temperature=0.6,
+    top_p=0.95,
     return_dict_in_generate=True,
 )
 
-print(model.tokenizer.decode(output.sequences[0]))
+# Decode only the newly generated tokens
+input_len = tokens["input_ids"].shape[1]
+print(model.tokenizer.decode(output.sequences[0][input_len:], skip_special_tokens=True))
 ```
 
 `AutoModel` automatically detects the model architecture from the HuggingFace config —
