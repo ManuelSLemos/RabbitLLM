@@ -2,6 +2,19 @@
 
 All notable changes to RabbitLLM are documented here.
 
+## [1.0.1] — 2026-02-22
+
+### Fixed
+- `rabbitllm.models` subpackage missing from installed wheel due to `.gitignore` pattern `models/` matching `src/rabbitllm/models/` during hatchling build; anchored to `/models/` and added explicit `include = ["src/rabbitllm/**"]` in `pyproject.toml`
+- `qwen3.py` not tracked in git for the same reason
+
+### Added
+- `scripts/quickstart.py` — minimal Python example (no CLI) for loading a model and generating text
+- CI now runs on `develop` branch in addition to `main`
+
+### Changed
+- README quickstart updated to use `apply_chat_template`, explicit `attention_mask`, device auto-detection and new-tokens-only decoding
+
 ## [1.0.0] — 2026-02-21
 
 Initial release of **RabbitLLM** — a complete rewrite and rebrand of the layer-streaming inference engine.
