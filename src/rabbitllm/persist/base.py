@@ -19,7 +19,10 @@ class ModelPersister(ABC):
 
     @classmethod
     def get_model_persister(cls) -> "ModelPersister":
-        """Return the default ModelPersister for this platform (Safetensor on Linux/Windows, MLX on macOS)."""
+        """Return the default ModelPersister for this platform.
+
+        Uses Safetensor on Linux/Windows, MLX on macOS.
+        """
         global _default_persister
         if _default_persister is not None:
             return _default_persister
@@ -41,9 +44,7 @@ class ModelPersister(ABC):
         ...
 
     @abstractmethod
-    def persist_model(
-        self, state_dict: Dict[str, Any], layer_name: str, path: Path
-    ) -> None:
+    def persist_model(self, state_dict: Dict[str, Any], layer_name: str, path: Path) -> None:
         """Save a layer state_dict under path with the layer name."""
         ...
 

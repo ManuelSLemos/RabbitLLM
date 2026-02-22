@@ -82,13 +82,13 @@ def load_layer_to_cpu(
             state_dict = load_layer_output
 
         # Populate cache if enabled and there is room.
-        if (
-            layer_cpu_cache is not None
-            and (cache_layers_limit is None or len(layer_cpu_cache) < cache_layers_limit)
+        if layer_cpu_cache is not None and (
+            cache_layers_limit is None or len(layer_cpu_cache) < cache_layers_limit
         ):
             # Store unpin'd CPU copies so they can be reused cheaply next token.
-            layer_cpu_cache[layer_name] = {k: v.clone() for k, v in state_dict.items()
-                                           if v.device.type == "cpu"}
+            layer_cpu_cache[layer_name] = {
+                k: v.clone() for k, v in state_dict.items() if v.device.type == "cpu"
+            }
 
     if prefetching and use_pin_memory:
         t = time.time()
@@ -146,7 +146,8 @@ def move_layer_to_device(
     hf_quantizer : object, optional
         If set, used to check/create quantized params; must have
         check_quantized_param(model, param_value, param_name, state_dict),
-        update_torch_dtype(device_map), create_quantized_param(model, tensor, param_name, device, state_dict).
+        update_torch_dtype(device_map),
+        create_quantized_param(model, tensor, param_name, device, state_dict).
 
     Returns
     -------
@@ -167,7 +168,7 @@ def move_layer_to_device(
                 dtype=dtype,
             )
         else:
-            torch_dtype = hf_quantizer.update_torch_dtype(None)
+            hf_quantizer.update_torch_dtype(None)
             hf_quantizer.create_quantized_param(
                 model,
                 state_dict[param_name],
@@ -207,7 +208,11 @@ def copy_layer_to_device_async(
                 # Preserve dtype for non-floating tensors (packed uint8 weights, quant metadata)
                 # and for quant-state keys (identified by ".4bit." / ".8bit." in the name).
                 # Only apply the model dtype to regular floating-point weight tensors.
-                if src.is_floating_point() and ".4bit." not in param_name and ".8bit." not in param_name:
+                if (
+                    src.is_floating_point()
+                    and ".4bit." not in param_name
+                    and ".8bit." not in param_name
+                ):
                     t = src.to(device, dtype=dtype, non_blocking=True)
                 else:
                     t = src.to(device, non_blocking=True)
@@ -233,7 +238,9 @@ def decompress_layer_on_device(
 
 
 def _set_param_direct(model: Any, param_name: str, tensor: torch.Tensor) -> None:
-    """Set a single parameter by full path (e.g. model.layers.0.input_layernorm.weight) without accelerate.
+    """Set a single parameter by full path without accelerate.
+
+    Full path example: model.layers.0.input_layernorm.weight
 
     Uses in-place data replacement (param.data = tensor) when the parameter already exists,
     to avoid replacing the Parameter object (which can cause stream-visibility issues when the
@@ -276,7 +283,8 @@ def set_layer_params_from_tensors(
     for param_name in param_names:
         t = tensors_on_device[param_name]
         if use_clone_fallback:
-            # Force tensor to be created on default stream (empty_like + copy_ run on current stream)
+            # Force tensor to be created on default stream
+            # (empty_like + copy_ run on current stream)
             t = torch.empty_like(t, device=t.device, dtype=t.dtype).copy_(t)
         if use_direct_set:
             _set_param_direct(model, param_name, t)

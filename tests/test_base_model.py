@@ -3,6 +3,7 @@
 All tests run without a GPU or network access. GPU-only tests are marked with
 ``@pytest.mark.skipif`` so they are skipped in CI.
 """
+
 from __future__ import annotations
 
 import unittest

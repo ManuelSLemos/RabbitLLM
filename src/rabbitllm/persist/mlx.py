@@ -1,12 +1,10 @@
 import logging
 import os
-from itertools import starmap
 from pathlib import Path
 
-import numpy as np
-import psutil
-import torch
 import mlx.core as mx
+import numpy as np
+import torch
 from mlx.utils import tree_unflatten
 
 from .base import ModelPersister

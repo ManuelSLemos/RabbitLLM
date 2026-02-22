@@ -37,7 +37,6 @@ classifiers = [
 compression = ["bitsandbytes"]
 flash = ["flash-attn>=2.5"]
 server = []
-dev = ["ruff", "pytest", "pytest-cov", "mypy"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rabbitllm"]
@@ -59,5 +58,8 @@ pythonpath = ["src"]
 
 [dependency-groups]
 dev = [
-    "pytest>=9.0.2",
+    "ruff>=0.9",
+    "pytest>=9.0",
+    "pytest-cov>=6.0",
+    "mypy>=1.0",
 ]

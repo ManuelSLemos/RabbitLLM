@@ -1,18 +1,17 @@
 """Tests for rabbitllm.utils.splitting."""
+
 import shutil
-from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
-import pytest
-
+from rabbitllm.utils.memory import NotEnoughSpaceException
 from rabbitllm.utils.splitting import (
     check_space,
     load_layer,
     remove_real_and_linked_file,
 )
-from rabbitllm.utils.memory import NotEnoughSpaceException
 
 
 def test_load_layer_returns_state_dict_from_persister():
@@ -27,9 +26,7 @@ def test_load_layer_returns_state_dict_from_persister():
 def test_load_layer_with_profiling_returns_tuple():
     persister = MagicMock()
     persister.load_model.return_value = {"weight": torch.randn(2, 2)}
-    result = load_layer(
-        "/fake/path", "model.layers.0", profiling=True, persister=persister
-    )
+    result = load_layer("/fake/path", "model.layers.0", profiling=True, persister=persister)
     assert isinstance(result, tuple)
     state_dict, elapsed = result
     assert isinstance(state_dict, dict)

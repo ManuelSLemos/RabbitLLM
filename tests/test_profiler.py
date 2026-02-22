@@ -1,4 +1,5 @@
 """Tests for rabbitllm.profiler."""
+
 from rabbitllm.profiler import LayeredProfiler
 
 

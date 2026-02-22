@@ -12,7 +12,7 @@ class LayeredProfiler:
         self.min_free_mem = 1024 * 1024 * 1024 * 1024
 
     def add_profiling_time(self, item, time):
-        if not item in self.profiling_time_dict:
+        if item not in self.profiling_time_dict:
             self.profiling_time_dict[item] = []
 
         self.profiling_time_dict[item].append(time)
@@ -33,6 +33,4 @@ class LayeredProfiler:
 
     def print_profiling_time(self):
         for item in self.profiling_time_dict.keys():
-            logger.info(
-                "total time for %s: %s", item, sum(self.profiling_time_dict[item])
-            )
+            logger.info("total time for %s: %s", item, sum(self.profiling_time_dict[item]))

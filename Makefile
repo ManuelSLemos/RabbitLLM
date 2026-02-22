@@ -1,7 +1,7 @@
 .PHONY: install dev lint format test test-cov typecheck clean bash
 
 install:
-	uv sync --extra dev
+	uv sync
 
 dev: install
 

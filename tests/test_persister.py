@@ -1,7 +1,7 @@
 """Tests for rabbitllm.persist (SafetensorModelPersister)."""
-import torch
 
 import pytest
+import torch
 
 from rabbitllm.persist.safetensor import SafetensorModelPersister
 

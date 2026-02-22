@@ -1,5 +1,5 @@
-import gc
 import ctypes
+import gc
 
 import torch
 

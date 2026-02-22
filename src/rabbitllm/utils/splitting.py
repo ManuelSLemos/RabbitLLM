@@ -8,21 +8,20 @@ from glob import glob
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
+import huggingface_hub
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 from tqdm import tqdm
 
-import huggingface_hub
-
-from .memory import NotEnoughSpaceException, clean_memory
-
-logger = logging.getLogger(__name__)
+from ..persist import ModelPersister
 from .compression import (
     bitsandbytes_installed,
     compress_layer_state_dict,
     uncompress_layer_state_dict,
 )
-from ..persist import ModelPersister
+from .memory import NotEnoughSpaceException, clean_memory
+
+logger = logging.getLogger(__name__)
 
 
 def remove_real_and_linked_file(to_delete: Union[Path, str]) -> None:
@@ -68,10 +67,15 @@ def check_space(
     )
 
     if free + total_saved_split_files_size_bytes < total_shard_files_size_bytes:
+        save_path = (
+            checkpoint_path if layer_shards_saving_path is None else layer_shards_saving_path
+        )
         raise NotEnoughSpaceException(
-            f"Not enough space. Free space under {checkpoint_path if layer_shards_saving_path is None else layer_shards_saving_path}:"
-            f" {free / 1024 / 1024 / 1024:.02f}GB. Model total size: {total_shard_files_size_bytes / 1024 / 1024 / 1024:.02f}GB. "
-            f"existing space under {checkpoint_path if layer_shards_saving_path is None else layer_shards_saving_path} assuming can reuse: {total_saved_split_files_size_bytes / 1024 / 1024 / 1024:.02f}GB. "
+            f"Not enough space. Free space under {save_path}:"
+            f" {free / 1024 / 1024 / 1024:.02f}GB."
+            f" Model total size: {total_shard_files_size_bytes / 1024 / 1024 / 1024:.02f}GB."
+            f" Existing space under {save_path} assuming can reuse:"
+            f" {total_saved_split_files_size_bytes / 1024 / 1024 / 1024:.02f}GB."
         )
 
 
@@ -204,7 +208,7 @@ def split_and_save_layers(
 
         if "rotary_pos_emb" in layer_names:
             layers = [layer_names["rotary_pos_emb"]] + layers
-        layers = [l + "." for l in layers]
+        layers = [name + "." for name in layers]
 
     if os.path.exists(saving_path):
         found_layers = {}
@@ -219,7 +223,8 @@ def split_and_save_layers(
             return str(saving_path)
         else:
             logger.warning(
-                "some layer splits found, some are not, re-save all layers in case there's some corruptions."
+                "some layer splits found, some are not, re-save all layers"
+                " in case there's some corruptions."
             )
 
     if not delete_original:
@@ -372,7 +377,8 @@ def find_or_create_local_splitted_path(
             )
         else:
             logger.warning(
-                "Found local directory in %s, but didn't find downloaded model. Try using it as a HF repo...",
+                "Found local directory in %s, but didn't find downloaded model."
+                " Try using it as a HF repo...",
                 model_local_path_or_repo_id,
             )
 

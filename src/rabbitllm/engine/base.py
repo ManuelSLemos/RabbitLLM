@@ -3,43 +3,47 @@ import functools
 import logging
 import time
 import warnings
-import torch
-
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
+
+import torch
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor
 from transformers import (
     AutoConfig,
-    AutoModelForCausalLM,
     AutoTokenizer,
     GenerationConfig,
 )
+
 try:
     from transformers import GenerationMixin
 except ImportError:
     from transformers.generation.utils import GenerationMixin
-from transformers.modeling_outputs import CausalLMOutputWithPast
 from accelerate.utils.modeling import set_module_tensor_to_device
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.quantizers import AutoHfQuantizer
 
 from ..persist import ModelPersister
 from ..profiler import LayeredProfiler
 from ..utils import (
     clean_memory,
-    load_layer,
     find_or_create_local_splitted_path,
     is_flash_attention_available,
+    load_layer,
 )
 from ..utils.platform import is_cuda_available
-from .attention import ATTN_FALLBACK_ORDER, resolve_attn_implementation, create_model_from_config
-from .model_init import create_model_with_attn_fallback
 from . import layer_loading as layer_loading_impl
+from .attention import ATTN_FALLBACK_ORDER, create_model_from_config, resolve_attn_implementation
 from .forward_utils import (
     _get_kv_from_dynamic_cache as _get_kv_from_dynamic_cache_fn,
+)
+from .forward_utils import (
     build_attention_mask_and_position_ids,
+)
+from .forward_utils import (
     extract_kv_from_layer_output as extract_kv_from_layer_output_fn,
 )
+from .model_init import create_model_with_attn_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +147,8 @@ class RabbitLLMBaseModel(GenerationMixin):
             layer_shards_saving_path: Where to save split layers. Default: model cache subdir.
             profiling_mode: If True, record load/forward timing in self.profiler.
             compression: "4bit" or "8bit" for quantized layers (requires bitsandbytes).
-            token: HuggingFace token for gated repos (preferred; v5 uses this). Use ``hf_token`` for backward compatibility.
+            token: HuggingFace token for gated repos (preferred; v5 uses this).
+                Use ``hf_token`` for backward compatibility.
             hf_token: Deprecated alias for ``token``; use ``token`` for new code.
             prefetching: Overlap layer load with compute when CUDA available.
             prefetch_pin_memory: If True (default), prefetched layers use pin_memory for faster
@@ -188,13 +193,16 @@ class RabbitLLMBaseModel(GenerationMixin):
         if compression is not None:
             if not bitsandbytes_installed:
                 raise ImportError(
-                    "WARNING: bitsandbytes not found. Compression needs bitsandbytes. To use compression, please install bitsandbytes: `pip install bitsandbytes`"
+                    "WARNING: bitsandbytes not found. Compression needs bitsandbytes."
+                    " To use compression, please install bitsandbytes: `pip install bitsandbytes`"
                 )
 
         self.compression = compression
         self._token = token if token is not None else hf_token
         self.hf_token = self._token  # backward compatibility
-        self._persister = persister if persister is not None else ModelPersister.get_model_persister()
+        self._persister = (
+            persister if persister is not None else ModelPersister.get_model_persister()
+        )
 
         # Save parameters
 
@@ -294,13 +302,14 @@ class RabbitLLMBaseModel(GenerationMixin):
             self.stream = None
             self.transfer_stream = None
 
-    # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
+    # if derived class needs to create generation config differently, like Mistral,
+    # this function can be overridden
     def get_generation_config(self):
         # protective on generation config
 
         try:
             return GenerationConfig.from_pretrained(self.model_local_path)
-        except Exception as e:
+        except Exception:
             return GenerationConfig()
 
     # a chance to customize tokenizer
@@ -349,7 +358,10 @@ class RabbitLLMBaseModel(GenerationMixin):
         if self.model is None:
             resolved_attn = self._resolve_attn_implementation()
             fallback_chain = ATTN_FALLBACK_ORDER.get(resolved_attn, ["sdpa", "eager"])
-            create_fn = lambda impl: create_model_from_config(self.config, attn_implementation=impl)
+
+            def create_fn(impl):
+                return create_model_from_config(self.config, attn_implementation=impl)
+
             self.model, self._active_attn_implementation = create_model_with_attn_fallback(
                 fallback_chain, create_fn, clean_memory
             )
@@ -524,13 +536,19 @@ class RabbitLLMBaseModel(GenerationMixin):
         return self.forward(*args, **kwargs)
 
     def get_past_key_values_cache_seq_len(self, past_key_values):
-        """Return cached sequence length; supports Cache objects (e.g. DynamicCache) and legacy tuple format."""
+        """Return cached sequence length.
+
+        Supports Cache objects (e.g. DynamicCache) and legacy tuple format.
+        """
         if cache_utils_installed and Cache is not None and isinstance(past_key_values, Cache):
             return past_key_values.get_seq_length(0)
         return past_key_values[0][0].shape[2]
 
     def _get_layer_past_kv(self, past_key_values, layer_idx):
-        """Return (k_cache, v_cache) for the given layer; supports Cache objects and legacy tuple format."""
+        """Return (k_cache, v_cache) for the given layer.
+
+        Supports Cache objects and legacy tuple format.
+        """
         if cache_utils_installed and Cache is not None and isinstance(past_key_values, Cache):
             if layer_idx >= len(past_key_values):
                 return None, None
@@ -541,7 +559,10 @@ class RabbitLLMBaseModel(GenerationMixin):
         return past_key_values[layer_idx][0], past_key_values[layer_idx][1]
 
     def get_sequence_len(self, seq):
-        """Return the sequence length (number of tokens). Handles (batch, seq_len, hidden) and (seq_len, hidden)."""
+        """Return the sequence length (number of tokens).
+
+        Handles (batch, seq_len, hidden) and (seq_len, hidden).
+        """
         if seq.dim() == 2:
             return seq.size(0)
         return seq.size(1)
@@ -630,16 +651,24 @@ class RabbitLLMBaseModel(GenerationMixin):
         return layer(seq)
 
     def _get_model_rotary_emb(self):
-        """Return the model's rotary_emb module if present (e.g. Qwen2). Used to compute position_embeddings once per forward."""
+        """Return the model's rotary_emb module if present (e.g. Qwen2).
+
+        Used to compute position_embeddings once per forward.
+        """
         if not hasattr(self.model, "model"):
             return None
         return getattr(self.model.model, "rotary_emb", None)
 
     def _compute_position_embeddings_from_model(self, batch, position_ids):
-        """Compute (cos, sin) once for RoPE. Prefer get_pos_emb_args (device-side) over the model's rotary_emb (may be on meta). Returns (cos, sin) or None."""
+        """Compute (cos, sin) once for RoPE.
+
+        Prefer get_pos_emb_args (device-side) over the model's rotary_emb
+        (may be on meta). Returns (cos, sin) or None.
+        """
         stacked = torch.cat(batch, dim=0)
         seq_len = stacked.size(1)
-        # Prefer device-side computation: model's rotary_emb is on meta and would produce meta tensors, causing "cuda is not on expected device meta" in decoder layers.
+        # Prefer device-side computation: model's rotary_emb is on meta and would
+        # produce meta tensors, causing "cuda is not on expected device meta" in decoder layers.
         if callable(getattr(self, "get_pos_emb_args", None)):
             pos_emb = self.get_pos_emb_args(0, seq_len)
             if pos_emb is not None and "position_embeddings" in pos_emb:
@@ -662,7 +691,10 @@ class RabbitLLMBaseModel(GenerationMixin):
         output_hidden_states,
         past_key_values,
     ):
-        """Run the layer-by-layer streaming forward; returns (batch, kv_cache_list, all_hidden_states, all_self_attns)."""
+        """Run the layer-by-layer streaming forward.
+
+        Returns (batch, kv_cache_list, all_hidden_states, all_self_attns).
+        """
         # Free any PyTorch-cached CUDA memory from previous operations before the layer loop.
         # This maximises available VRAM, especially when OOM risks are high (large embed/lm_head
         # already on GPU during decode steps, or prior runs leaving fragmented cache).
@@ -721,12 +753,15 @@ class RabbitLLMBaseModel(GenerationMixin):
 
         with torch.inference_mode(), ThreadPoolExecutor() as executor:
             if use_async_transfer:
-                # Two-phase async: copy of layer i+1 starts BEFORE forward of layer i so they truly overlap.
-                # Phase A (per iter): copy runs on transfer_stream while forward runs on default stream.
+                # Two-phase async: copy of layer i+1 starts BEFORE forward of layer i
+                # so they truly overlap.
+                # Phase A (per iter): copy runs on transfer_stream while forward runs on
+                # default stream.
                 # Phase B (per iter): after forward, sync transfer_stream and assign params.
                 use_dual_prefetch = n_layers > 3
-                # During decode steps, embed/norm/lm_head are already on GPU (_small_layers_on_gpu=True).
-                # Skip loading layer 0 (embed) and seed the pipeline from decoder layers directly.
+                # During decode steps, embed/norm/lm_head are already on GPU
+                # (_small_layers_on_gpu=True). Skip loading layer 0 (embed) and seed the
+                # pipeline from decoder layers directly.
                 _async_skip_layer0 = getattr(self, "_small_layers_on_gpu", False)
                 if self.profiling_mode:
                     t = time.time()
@@ -735,8 +770,16 @@ class RabbitLLMBaseModel(GenerationMixin):
                         # Embed already on GPU: load decoder_0, decoder_1, decoder_2 as the
                         # first three in-flight items (s1 + two prefetch slots).
                         fa = executor.submit(_load_cpu_fn, self.layer_names[1])
-                        fb = executor.submit(_load_cpu_fn, self.layer_names[2]) if n_layers > 2 else None
-                        fc = executor.submit(_load_cpu_fn, self.layer_names[3]) if n_layers > 3 else None
+                        fb = (
+                            executor.submit(_load_cpu_fn, self.layer_names[2])
+                            if n_layers > 2
+                            else None
+                        )
+                        fc = (
+                            executor.submit(_load_cpu_fn, self.layer_names[3])
+                            if n_layers > 3
+                            else None
+                        )
                         s0 = {}  # embed placeholder — already on GPU
                         s1 = fa.result()  # decoder_0
                         _next_cpu_future_0 = fb  # decoder_1, absolute index 2
@@ -758,7 +801,11 @@ class RabbitLLMBaseModel(GenerationMixin):
                 else:
                     if _async_skip_layer0:
                         fa = executor.submit(_load_cpu_fn, self.layer_names[1])
-                        fb = executor.submit(_load_cpu_fn, self.layer_names[2]) if n_layers > 2 else None
+                        fb = (
+                            executor.submit(_load_cpu_fn, self.layer_names[2])
+                            if n_layers > 2
+                            else None
+                        )
                         s0 = {}
                         s1 = fa.result()
                         _next_cpu_future_0 = fb
@@ -767,10 +814,18 @@ class RabbitLLMBaseModel(GenerationMixin):
                         _next_cpu_idx_1 = -1
                     else:
                         f0 = executor.submit(_load_cpu_fn, self.layer_names[0])
-                        f1 = executor.submit(_load_cpu_fn, self.layer_names[1]) if n_layers > 1 else None
+                        f1 = (
+                            executor.submit(_load_cpu_fn, self.layer_names[1])
+                            if n_layers > 1
+                            else None
+                        )
                         s0 = f0.result()
                         s1 = f1.result() if f1 is not None else None
-                        _next_cpu_future_0 = executor.submit(_load_cpu_fn, self.layer_names[2]) if n_layers > 2 else None
+                        _next_cpu_future_0 = (
+                            executor.submit(_load_cpu_fn, self.layer_names[2])
+                            if n_layers > 2
+                            else None
+                        )
                         _next_cpu_idx_0 = 2 if n_layers > 2 else -1
                         _next_cpu_future_1 = None
                         _next_cpu_idx_1 = -1
@@ -788,6 +843,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                     # move so set_module_tensor_to_device does not see .4bit.* keys.
                     if _async_decompress and s0:
                         from ..utils.compression import uncompress_layer_state_dict
+
                         s0 = uncompress_layer_state_dict(s0)
                     current_moved_layers = self.move_layer_to_device(s0)
                     current_s = s0
@@ -795,11 +851,16 @@ class RabbitLLMBaseModel(GenerationMixin):
                     self.profiler.add_profiling_time(
                         "create_layer_from_state_dict", time.time() - t
                     )
-                # Kick off async copy of first decoder layer NOW — overlaps with forward of embed (or layer 0).
+                # Kick off async copy of first decoder layer NOW — overlaps with forward of
+                # embed (or layer 0).
                 if s1 is not None:
                     _async_result = layer_loading_impl.move_layer_to_device_async(
-                        self.model, s1, self.running_device, self.running_dtype,
-                        stream=self.transfer_stream, hf_quantizer=self.hf_quantizer,
+                        self.model,
+                        s1,
+                        self.running_device,
+                        self.running_dtype,
+                        stream=self.transfer_stream,
+                        hf_quantizer=self.hf_quantizer,
                     )
                     _pending_tensors, _pending_param_names = _async_result
                     _pending_s_cpu = s1
@@ -886,7 +947,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                         batch[j] = self.run_lm_head(layer, seq)
                     else:
                         if output_hidden_states:
-                            all_hidden_states[i].append(new_seq)
+                            all_hidden_states[i].append(seq)
 
                         self._fix_layer_attention_head_dim(layer)
                         if past_key_values is not None:
@@ -989,7 +1050,10 @@ class RabbitLLMBaseModel(GenerationMixin):
 
                         batch[j] = new_seq
 
-                if layer_name == self.layer_names_dict["embed"] and self._get_model_rotary_emb() is not None:
+                if (
+                    layer_name == self.layer_names_dict["embed"]
+                    and self._get_model_rotary_emb() is not None
+                ):
                     self._position_embeddings_cache = self._compute_position_embeddings_from_model(
                         batch, position_ids
                     )
@@ -997,9 +1061,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                 if output_hidden_states:
                     all_hidden_states += (torch.cat(batch, 0),)
 
-                skip_meta = (
-                    use_cache and layer_name in small_layer_names
-                )
+                skip_meta = use_cache and layer_name in small_layer_names
                 if not skip_meta:
                     if self.hf_quantizer is not None:
                         for param_name in moved_layers:
@@ -1039,7 +1101,8 @@ class RabbitLLMBaseModel(GenerationMixin):
                         current_moved_layers = _pending_param_names
                         current_s = _pending_s_cpu
                         _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
-                    # Phase A (next iter): start async copy of layer i+2 to overlap with forward of layer i+1
+                    # Phase A (next iter): start async copy of layer i+2 to overlap with
+                    # forward of layer i+1
                     if (i + 2) < n_layers:
                         need_idx = i + 2
                         if use_dual_prefetch:
@@ -1065,7 +1128,11 @@ class RabbitLLMBaseModel(GenerationMixin):
                                 _pending_tensors, _pending_param_names = _async_result
                                 _pending_s_cpu = _next_cpu_s
                             else:
-                                _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
+                                _pending_tensors, _pending_param_names, _pending_s_cpu = (
+                                    None,
+                                    None,
+                                    None,
+                                )
                             # Refill consumed slot with load(i+4); the other slot already has i+3
                             if _consumed_slot == 0:
                                 _next_cpu_future_0 = (
@@ -1082,7 +1149,11 @@ class RabbitLLMBaseModel(GenerationMixin):
                                 )
                                 _next_cpu_idx_1 = (i + 4) if (i + 4) < n_layers else -1
                         else:
-                            _next_cpu_s = _next_cpu_future_0.result() if _next_cpu_future_0 is not None else None
+                            _next_cpu_s = (
+                                _next_cpu_future_0.result()
+                                if _next_cpu_future_0 is not None
+                                else None
+                            )
                             if _next_cpu_s is not None:
                                 _async_result = layer_loading_impl.move_layer_to_device_async(
                                     self.model,
@@ -1095,7 +1166,11 @@ class RabbitLLMBaseModel(GenerationMixin):
                                 _pending_tensors, _pending_param_names = _async_result
                                 _pending_s_cpu = _next_cpu_s
                             else:
-                                _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
+                                _pending_tensors, _pending_param_names, _pending_s_cpu = (
+                                    None,
+                                    None,
+                                    None,
+                                )
                             _next_cpu_future_0 = (
                                 executor.submit(_load_cpu_fn, self.layer_names[i + 3])
                                 if (i + 3) < n_layers
@@ -1119,9 +1194,7 @@ class RabbitLLMBaseModel(GenerationMixin):
 
     def _prepare_batch(self, input_ids):
         """Move input_ids to running device and shape as list of single-sequence tensors."""
-        return [
-            input_ids_unit.to(self.running_device).unsqueeze(0) for input_ids_unit in input_ids
-        ]
+        return [input_ids_unit.to(self.running_device).unsqueeze(0) for input_ids_unit in input_ids]
 
     def _create_masks(self):
         """Build attention mask and position_ids for the current forward (no past)."""
@@ -1156,8 +1229,10 @@ class RabbitLLMBaseModel(GenerationMixin):
             if any_empty:
                 if not self._warned_no_kv_cache:
                     logger.warning(
-                        "KV cache was not filled by decoder layers; returning past_key_values=None. "
-                        "Generation will work but each step re-runs the full forward (no incremental decoding)."
+                        "KV cache was not filled by decoder layers;"
+                        " returning past_key_values=None. "
+                        "Generation will work but each step re-runs the full forward"
+                        " (no incremental decoding)."
                     )
                     self._warned_no_kv_cache = True
                 kv_cache_list = None
@@ -1209,8 +1284,9 @@ class RabbitLLMBaseModel(GenerationMixin):
         return_dict: Optional[bool] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        """Run layer-streaming forward: load each layer to device, run, free; return logits and optional cache.
+        """Run layer-streaming forward.
 
+        Load each layer to device, run, free; return logits and optional cache.
         Rebuilds the model skeleton, runs the layer loop (with optional prefetch), assembles logits.
         """
         if self.profiling_mode:

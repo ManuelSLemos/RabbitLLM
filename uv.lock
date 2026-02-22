@@ -1212,19 +1212,16 @@ dependencies = [
 compression = [
     { name = "bitsandbytes" },
 ]
-dev = [
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "ruff" },
-]
 flash = [
     { name = "flash-attn" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "mypy" },
     { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
 ]
 
 [package.metadata]
@@ -1235,10 +1232,6 @@ requires-dist = [
     { name = "einops", specifier = ">=0.8.2" },
     { name = "flash-attn", marker = "extra == 'flash'", specifier = ">=2.5" },
     { name = "huggingface-hub", specifier = ">=0.20" },
-    { name = "mypy", marker = "extra == 'dev'" },
-    { name = "pytest", marker = "extra == 'dev'" },
-    { name = "pytest-cov", marker = "extra == 'dev'" },
-    { name = "ruff", marker = "extra == 'dev'" },
     { name = "safetensors", specifier = ">=0.4" },
     { name = "scipy" },
     { name = "sentencepiece", specifier = ">=0.1.99" },
@@ -1248,10 +1241,15 @@ requires-dist = [
     { name = "transformers", specifier = ">=5.0,<5.3" },
     { name = "transformers-stream-generator", specifier = ">=0.0.5" },
 ]
-provides-extras = ["compression", "flash", "server", "dev"]
+provides-extras = ["compression", "flash", "server"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.0.2" }]
+dev = [
+    { name = "mypy", specifier = ">=1.0" },
+    { name = "pytest", specifier = ">=9.0" },
+    { name = "pytest-cov", specifier = ">=6.0" },
+    { name = "ruff", specifier = ">=0.9" },
+]
 
 [[package]]
 name = "regex"

@@ -8,8 +8,9 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![CI](https://github.com/manuelslemos/rabbitllm/actions/workflows/ci.yml/badge.svg)](https://github.com/manuelslemos/rabbitllm/actions)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow?logo=buy-me-a-coffee)](https://buymeacoffee.com/l5gr4mn)
 
-RabbitLLM is a **fork of [AirLLM](https://github.com/airllm/airllm)**. It enables inference on large language models (70B+ parameters) on consumer GPUs with as little as 4GB VRAM by streaming model layers one at a time through GPU memory. No quantization, distillation, or pruning needed — full model quality.
+RabbitLLM is a **fork of [AirLLM](https://github.com/lyogavin/airllm)**. It enables inference on large language models (70B+ parameters) on consumer GPUs with as little as 4GB VRAM by streaming model layers one at a time through GPU memory. No quantization, distillation, or pruning needed — full model quality.
 
 ### Compatibility (current status)
 

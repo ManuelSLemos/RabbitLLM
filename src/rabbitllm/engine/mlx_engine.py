@@ -1,28 +1,19 @@
-import argparse
 import gc
-import json
 import logging
-import time
-from tqdm import tqdm
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from sentencepiece import SentencePieceProcessor
-from ..persist import ModelPersister
 import psutil
+from tqdm import tqdm
 from transformers import (
     AutoConfig,
-    AutoModelForCausalLM,
     AutoTokenizer,
-    AutoModel,
-    GenerationMixin,
-    LlamaForCausalLM,
-    GenerationConfig,
 )
-from ..utils import clean_memory, load_layer, find_or_create_local_splitted_path
+
+from ..persist import ModelPersister
+from ..utils import find_or_create_local_splitted_path
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +217,8 @@ class RabbitLLMLlamaMlx:
         max_consumed = self.initial_available - self.least_available
 
         logger.debug(
-            "[%s] - available mem: %.02fmb, consumed: %.02fmb, least available: %.02fmb, max consumed: %.02fmb",
+            "[%s] - available mem: %.02fmb, consumed: %.02fmb,"
+            " least available: %.02fmb, max consumed: %.02fmb",
             msg,
             available,
             consumed,
@@ -309,7 +301,6 @@ class RabbitLLMLlamaMlx:
 
     def model_generate(self, x, temperature=0, max_new_tokens=None):
         cache = []
-        TEST_NO_LAYERED = True
 
         # Make an additive causal mask. We will need that to process the prompt.
         mask = nn.MultiHeadAttention.create_additive_causal_mask(x.shape[1])
@@ -349,24 +340,24 @@ class RabbitLLMLlamaMlx:
 
         for il in tqdm(range(self.model_args.n_layers), desc="running layers"):
             self.record_memory(f"before layer {il}")
-            l = TransformerBlock(args=self.model_args)
-            l.update(
+            layer = TransformerBlock(args=self.model_args)
+            layer.update(
                 ModelPersister.get_model_persister().load_model(
                     f"{self.layer_names_dict['layer_prefix']}.{il}", self.checkpoint_path
                 )["layers"][il]
             )
 
-            x, c = l(x, mask=mask)
+            x, c = layer(x, mask=mask)
             # force execution
             mx.eval(x)
             # We store the per layer cache in a simple python list
             cache.append(c)
 
             if not self.test_nonlayered:
-                del l
+                del layer
                 gc.collect()
             else:
-                self.layers.append(l)
+                self.layers.append(layer)
             self.record_memory(f"after layer {il}")
 
         self.record_memory("before_norm")
@@ -445,20 +436,20 @@ class RabbitLLMLlamaMlx:
                 # old cache the moment it is not needed anymore.
 
                 if not self.test_nonlayered:
-                    l = TransformerBlock(args=self.model_args)
-                    l.update(
+                    layer = TransformerBlock(args=self.model_args)
+                    layer.update(
                         ModelPersister.get_model_persister().load_model(
                             f"{self.layer_names_dict['layer_prefix']}.{i}", self.checkpoint_path
                         )["layers"][i]
                     )
                 else:
-                    l = self.layers[i]
+                    layer = self.layers[i]
 
-                x, cache[i] = l(x, mask=None, cache=cache[i])
+                x, cache[i] = layer(x, mask=None, cache=cache[i])
                 # force execution
                 mx.eval(x)
                 if not self.test_nonlayered:
-                    del l
+                    del layer
                     gc.collect()
                 self.record_memory(f"after layer {il}")
 

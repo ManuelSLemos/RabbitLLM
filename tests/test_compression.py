@@ -35,9 +35,8 @@ class TestCompression(unittest.TestCase):
                 b = compress_layer_state_dict(a_state_dict, compression)
 
                 if iloop < 2:
-                    print(
-                        f"for compression {compression}, compressed to: { {k: v.shape for k, v in b.items()} }"
-                    )
+                    shapes = {k: v.shape for k, v in b.items()}
+                    print(f"for compression {compression}, compressed to: {shapes}")
 
                 aa = uncompress_layer_state_dict(b)
 

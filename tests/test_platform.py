@@ -1,4 +1,5 @@
 """Tests for rabbitllm.utils.platform."""
+
 from rabbitllm.utils.platform import (
     is_cuda_available,
     is_flash_attention_available,

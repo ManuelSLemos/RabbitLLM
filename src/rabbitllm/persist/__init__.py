@@ -1,1 +1,1 @@
-from .base import ModelPersister
+from .base import ModelPersister as ModelPersister

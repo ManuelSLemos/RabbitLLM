@@ -60,7 +60,11 @@ def is_flash_attention_available():
         flash_installed = False
 
     if not flash_installed:
-        return False, "flash-attn package is not installed (install with: pip install flash-attn or uv sync --extra flash)"
+        return (
+            False,
+            "flash-attn package is not installed"
+            " (install with: pip install flash-attn or uv sync --extra flash)",
+        )
 
     if not torch.cuda.is_available():
         return False, "CUDA is not available"

@@ -74,7 +74,7 @@ def decompress_after_async_copy(tensors_on_device: dict) -> dict:
         # Collect quant-state entries that belong to this param
         prefix = param_name + "."
         quant_meta = {
-            k[len(param_name):]: v
+            k[len(param_name) :]: v
             for k, v in tensors_on_device.items()
             if k.startswith(prefix) and k != param_name
         }
