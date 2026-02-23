@@ -2,6 +2,20 @@
 
 All notable changes to RabbitLLM are documented here.
 
+## [1.1.0]
+
+### Added
+- **GPU Direct Storage (kvikio)**: When `kvikio-cu12` is installed, layers load directly from disk to GPU,
+  bypassing CPU and pin_memory. Install with `pip install rabbitllm[gds]`.
+- **DiskKVCache**: `kv_cache_dir` option to offload KV cache to SSD for 50k+ token contexts.
+- **example.py** in project root for quick onboarding.
+- **samples/** directory with sample text for long-context testing.
+- `use_gds` parameter (default `True`) to enable/disable kvikio when available.
+
+### Changed
+- `load_layer_to_cpu` now tries kvikio (GDS) first when available and compression is not used.
+- README documents `use_gds`, `kv_cache_dir`, and the optional `[gds]` extra.
+
 ## [1.0.1] — 2026-02-22
 
 ### Fixed

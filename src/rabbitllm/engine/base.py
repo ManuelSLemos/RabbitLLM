@@ -133,6 +133,8 @@ class RabbitLLMBaseModel(GenerationMixin):
         persister: Optional[Any] = None,
         show_layer_progress: bool = True,
         cache_layers: Optional[int] = None,
+        use_gds: bool = True,
+        kv_cache_dir: Optional[str] = None,
     ) -> None:
         """Initialize the layer-streaming model from a checkpoint or HuggingFace repo.
 
@@ -171,8 +173,21 @@ class RabbitLLMBaseModel(GenerationMixin):
                 NOT performed — oldest entries stay).  Set to the number of layers that fit
                 in your available RAM budget (e.g. 30 for a 32 GB machine with 4-bit weights).
                 Pass ``None`` (default) to disable caching.
+            use_gds: If True and kvikio installed, load layers directly from disk to GPU
+                (GPU Direct Storage), bypassing CPU and pin_memory. Set to False or install
+                without kvikio to use the standard disk→CPU→GPU path.
+            kv_cache_dir: If set, offload KV cache to disk (enables 50k+ token context).
+                Pass None for in-memory cache (default).
         """
+        self.kv_cache_dir = kv_cache_dir
+        self.use_gds = use_gds and compression is None  # GDS only for uncompressed
+        if self.use_gds:
+            from ..utils.kvikio_loader import kvikio_available
 
+            if kvikio_available:
+                logger.info("GPU Direct Storage (kvikio) enabled: loading layers directly disk→GPU")
+            else:
+                self.use_gds = False
         self.profiling_mode = profiling_mode
         self.profiler = LayeredProfiler()
 
@@ -469,6 +484,9 @@ class RabbitLLMBaseModel(GenerationMixin):
             decompress=decompress,
             layer_cpu_cache=self._layer_cpu_cache if self._cache_layers_limit is not None else None,
             cache_layers_limit=self._cache_layers_limit,
+            use_gds=getattr(self, "use_gds", False),
+            device=self.running_device,
+            dtype=self.running_dtype,
         )
 
     def clear_layer_cache(self) -> None:
@@ -607,10 +625,19 @@ class RabbitLLMBaseModel(GenerationMixin):
             cache_class=Cache,
         )
 
-    def _make_layer_past_kv_arg(self, k_cache=None, v_cache=None):
+    def _make_layer_past_kv_arg(self, k_cache=None, v_cache=None, decoder_layer_idx: int = 0):
         """Build the past_key_value argument appropriate for the attention implementation."""
         if self._uses_cache_objects:
-            cache = DynamicCache()
+            if getattr(self, "kv_cache_dir", None):
+                from .kvcache import DiskKVCache
+
+                cache = DiskKVCache(
+                    self.kv_cache_dir,
+                    device=self.running_device,
+                    decoder_layer_idx=decoder_layer_idx,
+                )
+            else:
+                cache = DynamicCache()
             if k_cache is not None and v_cache is not None:
                 cache.update(k_cache, v_cache, 0)
             # Qwen2 and other 4.47+ decoder layers expect past_key_values (plural)
@@ -960,7 +987,9 @@ class RabbitLLMBaseModel(GenerationMixin):
                             attention_mask_args = self.get_attention_mask_args(
                                 attention_mask, len_p, len_s
                             )
-                            past_key_value_args = self._make_layer_past_kv_arg(k_cache, v_cache)
+                            past_key_value_args = self._make_layer_past_kv_arg(
+                                k_cache, v_cache, decoder_layer_idx=i - 1
+                            )
                             # During decode the position is len_p (past tokens), not 0.
                             # Never reuse _position_embeddings_cache here — it was computed for
                             # the prefill sequence starting at position 0 and would produce wrong
@@ -1019,7 +1048,9 @@ class RabbitLLMBaseModel(GenerationMixin):
                                 }
                                 new_seq = layer(seq, **kwargs)[0]
                             else:
-                                past_kv_args = self._make_layer_past_kv_arg()
+                                past_kv_args = self._make_layer_past_kv_arg(
+                                    decoder_layer_idx=i - 1
+                                )
                                 pos_slice = position_ids[:, 0:len_seq]
                                 kwargs = {
                                     "use_cache": True,

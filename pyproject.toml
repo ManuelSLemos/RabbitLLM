@@ -36,6 +36,7 @@ classifiers = [
 [project.optional-dependencies]
 compression = ["bitsandbytes"]
 flash = ["flash-attn>=2.5"]
+gds = ["kvikio-cu12"]
 server = []
 
 [tool.hatch.build.targets.wheel]

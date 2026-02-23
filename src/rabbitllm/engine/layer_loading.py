@@ -8,6 +8,7 @@ import torch
 from accelerate.utils.modeling import set_module_tensor_to_device
 
 from ..utils import load_layer
+from ..utils.kvikio_loader import kvikio_available, load_safetensor_layer_to_gpu
 from ..utils.platform import is_cuda_available
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,9 @@ def load_layer_to_cpu(
     decompress: bool = True,
     layer_cpu_cache: Optional[dict] = None,
     cache_layers_limit: Optional[int] = None,
+    use_gds: bool = True,
+    device: str = "cuda:0",
+    dtype: Optional[torch.dtype] = None,
 ) -> Dict[str, torch.Tensor]:
     """Load a layer's state_dict from checkpoint to CPU, optionally with pin_memory for prefetch.
 
@@ -49,11 +53,32 @@ def load_layer_to_cpu(
         Pass False when using the async GPU transfer pipeline so that decompression is
         deferred to Phase B on the default CUDA stream (see base.py Phase B logic).
 
+    use_gds : bool
+        If True and kvikio available and no compression, try loading directly to GPU.
+    device : str
+        Target device for GDS path (e.g. "cuda:0").
+    dtype : torch.dtype, optional
+        Target dtype for GDS path.
+
     Returns
     -------
     dict
-        state_dict for the layer (CPU tensors, possibly compressed when decompress=False).
+        state_dict for the layer (CPU tensors, or GPU tensors when GDS used).
     """
+    # Try GPU Direct Storage first when applicable (bypasses CPU, pin_memory)
+    if use_gds and decompress and dtype is not None and device.startswith("cuda"):
+        gds_state = load_layer_direct_to_gpu(
+            checkpoint_path,
+            layer_name,
+            device,
+            dtype,
+            profiling_mode=profiling_mode,
+            profiler=profiler,
+            persister=persister,
+        )
+        if gds_state:
+            return gds_state
+
     cache_hit = layer_cpu_cache is not None and layer_name in layer_cpu_cache
 
     if cache_hit:
@@ -322,3 +347,40 @@ def move_layer_to_device_async(
         state_dict, device, dtype, stream, hf_quantizer, model
     )
     return tensors_on_device, param_names
+
+
+def load_layer_direct_to_gpu(
+    checkpoint_path: str,
+    layer_name: str,
+    device: str,
+    dtype: torch.dtype,
+    profiling_mode: bool = False,
+    profiler: Optional[Any] = None,
+    persister: Optional[Any] = None,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Load a layer directly from disk to GPU via kvikio (GPU Direct Storage).
+
+    Bypasses CPU, pin_memory, and CPU→GPU transfer. Use when kvikio is available
+    and compression is not used. Returns None if kvikio path cannot be used.
+
+    Returns
+    -------
+    state_dict with tensors on device, or None to fall back to CPU path.
+    """
+    if not kvikio_available:
+        return None
+    if not device.startswith("cuda"):
+        return None
+
+    t = time.time()
+    state_dict = load_safetensor_layer_to_gpu(
+        checkpoint_path, layer_name, device, dtype=dtype, persister=persister
+    )
+    if not state_dict:
+        return None
+
+    elapsed = time.time() - t
+    if profiling_mode and profiler is not None:
+        profiler.add_profiling_time("load_safe_tensor_gds", elapsed)
+
+    return state_dict

@@ -49,5 +49,6 @@ coverage.xml
 *.swo
 
 # Local model cache (downloads and split layers) — do not commit
-/models/
 /.models/
+
+examples

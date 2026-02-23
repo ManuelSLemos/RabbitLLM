@@ -130,6 +130,8 @@ model = AutoModel.from_pretrained(
     max_seq_len=512,             # maximum sequence length
     prefetching=True,            # overlap layer loading with compute
     prefetch_pin_memory=True,    # faster CPU→GPU for small/medium models
+    use_gds=True,                # GPU Direct Storage (kvikio) when available
+    kv_cache_dir=None,           # path to offload KV cache for long context (50k+ tokens)
     token="hf_...",              # HuggingFace token for gated repos
     layer_shards_saving_path="/path/to/cache",  # custom split cache directory
     profiling_mode=False,        # print per-layer timing
@@ -149,6 +151,41 @@ model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", compression="4bi
 ```
 
 Requires `bitsandbytes`: `pip install bitsandbytes`.
+
+### GPU Direct Storage (optional)
+
+For CUDA without compression, install `kvikio-cu12` to load layers directly from disk to GPU,
+bypassing CPU and pin_memory (can significantly speed up 70B+ models):
+
+```bash
+pip install rabbitllm[gds]
+# or: pip install kvikio-cu12
+```
+
+Set `use_gds=False` to disable.
+
+### Long context (KV cache on disk)
+
+For 50k+ token contexts, pass `kv_cache_dir` to offload KV cache to SSD:
+
+```python
+model = AutoModel.from_pretrained("Qwen/Qwen2.5-72B-Instruct", kv_cache_dir="./kv_cache")
+```
+
+### Benchmarking improvements
+
+To measure GDS and DiskKVCache improvements:
+
+```bash
+# Local: make install pulls in kvikio (--extra gds)
+make install
+uv run python scripts/benchmark_improvements.py --mode gds
+uv run python scripts/benchmark_improvements.py --mode long_context
+
+# Docker (make bash): install with GDS first
+pip install -e ".[gds]"
+python scripts/benchmark_improvements.py --mode gds
+```
 
 ### Gated models
 
