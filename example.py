@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
 """
-RabbitLLM example — minimal inference script.
-
-Run: python example.py
-Or:  uv run python example.py
-
-Uses a small model (Qwen2.5-0.5B) for fast testing. For larger models or long
-context, see scripts/quickstart.py and the Configuration section in README.
+Inferencia 70B+ sin cuantización, con KV cache en disco (evita OOM en 8 GB VRAM).
 """
 
+import tempfile
 import warnings
 
 import torch
@@ -16,17 +11,23 @@ from rabbitllm import AutoModel
 
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", message=".*CUDA.*unknown error.*", category=UserWarning)
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+# Directorio para el KV cache (en disco, no en GPU)
+kv_cache_dir = tempfile.mkdtemp(prefix="rabbitllm_kv_")
+# Para uso persistente: kv_cache_dir = "./kv_cache"
 
 model = AutoModel.from_pretrained(
-    "Qwen/Qwen2.5-0.5B-Instruct",
+    "Qwen/Qwen2.5-72B-Instruct",
     device=device,
-    compression="4bit",
+    compression=None,           # sin cuantización, full precision
+    kv_cache_dir=kv_cache_dir, # KV cache a disco → evita OOM en 8 GB
+    max_seq_len=512,           # ajusta si necesitas contexto más largo
 )
 
 messages = [
     {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "What is 2 + 2? Answer briefly."},
+    {"role": "user", "content": "What is the capital of France? Answer in one sentence."},
 ]
 
 input_text = model.tokenizer.apply_chat_template(
