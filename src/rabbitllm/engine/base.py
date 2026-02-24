@@ -137,6 +137,8 @@ class RabbitLLMBaseModel(GenerationMixin):
         cache_layers: Optional[int] = None,
         use_gds: bool = True,
         kv_cache_dir: Optional[str] = None,
+        offload_small_layers: bool = False,
+        offload_small_layers_use_cpu_cache: bool = True,
     ) -> None:
         """Initialize the layer-streaming model from a checkpoint or HuggingFace repo.
 
@@ -180,8 +182,19 @@ class RabbitLLMBaseModel(GenerationMixin):
                 without kvikio to use the standard disk→CPU→GPU path.
             kv_cache_dir: If set, offload KV cache to disk (enables 50k+ token context).
                 Pass None for in-memory cache (default).
+            offload_small_layers: If True, embed/norm/lm_head are not kept on GPU; they are
+                loaded each forward and freed after use (avoids OOM on small VRAM). Use with
+                kv_cache_dir for large models (e.g. 72B) without quantization.
+            offload_small_layers_use_cpu_cache: If True (default when offload_small_layers),
+                keep state_dict of embed/norm/lm_head in CPU RAM and copy to GPU each forward
+                instead of reading from disk (oLLM-like speed). Uses ~2.5–5 GiB RAM for 72B.
         """
         self.kv_cache_dir = kv_cache_dir
+        self.offload_small_layers = offload_small_layers
+        self.offload_small_layers_use_cpu_cache = (
+            offload_small_layers_use_cpu_cache if offload_small_layers else False
+        )
+        self._small_layers_cpu_cache: dict = {}  # {layer_name: state_dict (CPU tensors)}
         self.use_gds = use_gds and compression is None  # GDS only for uncompressed
         if self.use_gds:
             from ..utils.kvikio_loader import kvikio_available
@@ -778,10 +791,13 @@ class RabbitLLMBaseModel(GenerationMixin):
         #   and causes OOM.  It is excluded and reloaded each token via the async pipeline
         #   (Phase A of the last decoder layer), fully overlapping with compute.
         _tie_weights = getattr(self.config, "tie_word_embeddings", False)
-        small_layer_names = (
-            self.layer_names_dict["embed"],
-            self.layer_names_dict["norm"],
-        ) + ((self.layer_names_dict["lm_head"],) if _tie_weights else ())
+        if getattr(self, "offload_small_layers", False):
+            small_layer_names = ()
+        else:
+            small_layer_names = (
+                self.layer_names_dict["embed"],
+                self.layer_names_dict["norm"],
+            ) + ((self.layer_names_dict["lm_head"],) if _tie_weights else ())
         # Async transfer: copy of layer i+1 starts BEFORE forward of layer i so they overlap.
         # Set to False to fall back to sync prefetch (CPU background load only).
         # See docs/TROUBLESHOOTING.md "Async CPU→GPU transfer".
@@ -808,6 +824,31 @@ class RabbitLLMBaseModel(GenerationMixin):
             else self.load_layer_to_cpu
         )
 
+        # Names of small layers that may be served from CPU cache to skip disk reads.
+        # lm_head is excluded when tie_word_embeddings because it shares embed's weight
+        # and is handled separately during inference (no standalone safetensor entry).
+        _cacheable_layer_names: frozenset = frozenset(
+            filter(
+                None,
+                [
+                    self.layer_names_dict.get("embed"),
+                    self.layer_names_dict.get("norm"),
+                    None if _tie_weights else self.layer_names_dict.get("lm_head"),
+                ],
+            )
+        )
+
+        def _load_cpu_or_cache(name: str):
+            """Return cached CPU state-dict for small layers (no disk I/O), else load normally."""
+            if (
+                self.offload_small_layers
+                and self.offload_small_layers_use_cpu_cache
+                and name in _cacheable_layer_names
+                and name in self._small_layers_cpu_cache
+            ):
+                return self._small_layers_cpu_cache[name]
+            return _load_cpu_fn(name)
+
         with torch.inference_mode(), ThreadPoolExecutor() as executor:
             if use_async_transfer:
                 # Two-phase async: copy of layer i+1 starts BEFORE forward of layer i
@@ -815,7 +856,15 @@ class RabbitLLMBaseModel(GenerationMixin):
                 # Phase A (per iter): copy runs on transfer_stream while forward runs on
                 # default stream.
                 # Phase B (per iter): after forward, sync transfer_stream and assign params.
-                use_dual_prefetch = n_layers > 3
+                # Dual-prefetch loads 4 layers concurrently (embed + 3 decoders) at startup.
+                # For Qwen-72B each decoder layer is ~1.76 GiB (gate/up/down_proj at 462 MiB
+                # each), so 4 layers fill 7.77 GiB — the entire 8 GB GPU — before the loop
+                # begins.  When offload_small_layers is active we already know VRAM is
+                # tight, so fall back to single-prefetch (max 3 layers in flight at once:
+                # current + pending-copy + one background load ≈ 5.8 GiB peak).
+                use_dual_prefetch = n_layers > 3 and not getattr(
+                    self, "offload_small_layers", False
+                )
                 # During decode steps, embed/norm/lm_head are already on GPU
                 # (_small_layers_on_gpu=True). Skip loading layer 0 (embed) and seed the
                 # pipeline from decoder layers directly.
@@ -826,14 +875,14 @@ class RabbitLLMBaseModel(GenerationMixin):
                     if _async_skip_layer0:
                         # Embed already on GPU: load decoder_0, decoder_1, decoder_2 as the
                         # first three in-flight items (s1 + two prefetch slots).
-                        fa = executor.submit(_load_cpu_fn, self.layer_names[1])
+                        fa = executor.submit(_load_cpu_or_cache, self.layer_names[1])
                         fb = (
-                            executor.submit(_load_cpu_fn, self.layer_names[2])
+                            executor.submit(_load_cpu_or_cache, self.layer_names[2])
                             if n_layers > 2
                             else None
                         )
                         fc = (
-                            executor.submit(_load_cpu_fn, self.layer_names[3])
+                            executor.submit(_load_cpu_or_cache, self.layer_names[3])
                             if n_layers > 3
                             else None
                         )
@@ -845,10 +894,10 @@ class RabbitLLMBaseModel(GenerationMixin):
                         _next_cpu_idx_1 = 3 if n_layers > 3 else -1
                     else:
                         # Normal prefill: submit four loads so two layers stay in flight.
-                        f0 = executor.submit(_load_cpu_fn, self.layer_names[0])
-                        f1 = executor.submit(_load_cpu_fn, self.layer_names[1])
-                        f2 = executor.submit(_load_cpu_fn, self.layer_names[2])
-                        f3 = executor.submit(_load_cpu_fn, self.layer_names[3])
+                        f0 = executor.submit(_load_cpu_or_cache, self.layer_names[0])
+                        f1 = executor.submit(_load_cpu_or_cache, self.layer_names[1])
+                        f2 = executor.submit(_load_cpu_or_cache, self.layer_names[2])
+                        f3 = executor.submit(_load_cpu_or_cache, self.layer_names[3])
                         s0 = f0.result()
                         s1 = f1.result()
                         _next_cpu_future_0 = f2
@@ -857,9 +906,9 @@ class RabbitLLMBaseModel(GenerationMixin):
                         _next_cpu_idx_1 = 3
                 else:
                     if _async_skip_layer0:
-                        fa = executor.submit(_load_cpu_fn, self.layer_names[1])
+                        fa = executor.submit(_load_cpu_or_cache, self.layer_names[1])
                         fb = (
-                            executor.submit(_load_cpu_fn, self.layer_names[2])
+                            executor.submit(_load_cpu_or_cache, self.layer_names[2])
                             if n_layers > 2
                             else None
                         )
@@ -870,16 +919,16 @@ class RabbitLLMBaseModel(GenerationMixin):
                         _next_cpu_future_1 = None
                         _next_cpu_idx_1 = -1
                     else:
-                        f0 = executor.submit(_load_cpu_fn, self.layer_names[0])
+                        f0 = executor.submit(_load_cpu_or_cache, self.layer_names[0])
                         f1 = (
-                            executor.submit(_load_cpu_fn, self.layer_names[1])
+                            executor.submit(_load_cpu_or_cache, self.layer_names[1])
                             if n_layers > 1
                             else None
                         )
                         s0 = f0.result()
                         s1 = f1.result() if f1 is not None else None
                         _next_cpu_future_0 = (
-                            executor.submit(_load_cpu_fn, self.layer_names[2])
+                            executor.submit(_load_cpu_or_cache, self.layer_names[2])
                             if n_layers > 2
                             else None
                         )
@@ -923,8 +972,23 @@ class RabbitLLMBaseModel(GenerationMixin):
                     _pending_s_cpu = s1
                 else:
                     _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
+                # Release local references to the initial state dicts so the GDS-loaded
+                # tensors are freed as soon as current_s / _pending_s_cpu are consumed.
+                # Without this, s0/s1 keep the embed (2.32 GiB) and first decoder layer
+                # alive for the entire inference pass, reducing available VRAM.
+                s0 = s1 = None
             elif self.prefetching:
-                future = executor.submit(_load_cpu_fn, self.layer_names[0])
+                future = executor.submit(_load_cpu_or_cache, self.layer_names[0])
+
+            # Flush CuPy pool after the initial concurrent GDS loads.
+            # When use_gds=True, load_layer_to_cpu allocates a temporary CuPy buffer for
+            # each tensor (disk→GPU via kvikio) and then copies it to a contiguous PyTorch
+            # tensor. The CuPy buffers are freed back to CuPy's pool but NOT to CUDA until
+            # we call free_all_blocks(). For Qwen-72B the embed alone is 2.32 GiB, and the
+            # 4 concurrent initial loads (embed + 3 decoder layers) fill ~7.4 GiB before
+            # the main loop even starts — triggering OOM on 8 GB GPUs. Flushing here gives
+            # back those dead pool blocks so every subsequent layer load has room.
+            clean_memory()
 
             layer_iter = enumerate(zip(self.layer_names, self.layers))
             if getattr(self, "show_layer_progress", True):
@@ -935,42 +999,122 @@ class RabbitLLMBaseModel(GenerationMixin):
                 )
 
             for i, (layer_name, layer) in layer_iter:
-                if layer_name in small_layer_names and getattr(self, "_small_layers_on_gpu", False):
-                    state_dict = {}
-                    moved_layers = []
-                elif use_async_transfer:
-                    state_dict = current_s
-                    moved_layers = current_moved_layers
-                elif self.prefetching:
-                    if self.profiling_mode:
-                        t = time.time()
-                    state_dict = future.result()
-                    if self.profiling_mode:
-                        self.profiler.add_profiling_time(
-                            "load_safe_tensor_cpu_wait", time.time() - t
-                        )
-                    if self.profiling_mode:
-                        t = time.time()
-                    moved_layers = self.move_layer_to_device(state_dict)
-                    if self.profiling_mode:
-                        self.profiler.add_profiling_time(
-                            "create_layer_from_state_dict", time.time() - t
-                        )
-                    if (i + 1) < len(self.layer_names):
+                state_dict = None
+                moved_layers = None
+                _from_small_layer_cache = False
+                _is_tied_lm_head = (
+                    layer_name == self.layer_names_dict.get("lm_head")
+                    and _tie_weights
+                )
+                # On the async path the pipeline already serves small layers from
+                # _load_cpu_or_cache, so the in-loop cache check is redundant for
+                # embed/norm/lm_head (non-tied).  Exception: tied lm_head has no
+                # standalone safetensor — async loads an empty dict — so the cache
+                # must be consulted here to supply the embed weight as lm_head.
+                _check_cache = (
+                    not use_async_transfer or _is_tied_lm_head
+                ) and getattr(self, "offload_small_layers", False) and getattr(
+                    self, "offload_small_layers_use_cpu_cache", False
+                )
+                if _check_cache:
+                    _cache_key = (
+                        self.layer_names_dict["embed"]
+                        if _is_tied_lm_head
+                        else layer_name
+                    )
+                    if _cache_key in self._small_layers_cpu_cache:
+                        _from_small_layer_cache = True
+                        _cached = self._small_layers_cpu_cache[_cache_key]
+                        if _is_tied_lm_head:
+                            _embed_key = (
+                                self.layer_names_dict["embed"] + ".weight"
+                            )
+                            _lm_head_key = (
+                                self.layer_names_dict["lm_head"] + ".weight"
+                            )
+                            if _embed_key in _cached:
+                                set_module_tensor_to_device(
+                                    self.model,
+                                    _lm_head_key,
+                                    self.running_device,
+                                    value=_cached[_embed_key].to(
+                                        self.running_device
+                                    ),
+                                    dtype=self.running_dtype,
+                                )
+                            state_dict = _cached
+                            moved_layers = []
+                        else:
+                            state_dict = {
+                                k: v.clone() for k, v in _cached.items()
+                            }
+                            moved_layers = self.move_layer_to_device(
+                                state_dict
+                            )
+                if not _from_small_layer_cache:
+                    if layer_name in small_layer_names and getattr(
+                        self, "_small_layers_on_gpu", False
+                    ):
+                        state_dict = {}
+                        moved_layers = []
+                    elif use_async_transfer:
+                        state_dict = current_s
+                        moved_layers = current_moved_layers
+                    elif self.prefetching:
                         if self.profiling_mode:
                             t = time.time()
-                        future = executor.submit(_load_cpu_fn, self.layer_names[i + 1])
+                        state_dict = future.result()
                         if self.profiling_mode:
-                            self.profiler.add_profiling_time("kick_off_load_cpu", time.time() - t)
-                else:
-                    state_dict = self.load_layer_to_cpu(layer_name)
-                    if self.profiling_mode:
-                        t = time.time()
-                    moved_layers = self.move_layer_to_device(state_dict)
-                    if self.profiling_mode:
-                        self.profiler.add_profiling_time(
-                            "create_layer_from_safe_tensor", time.time() - t
+                            self.profiler.add_profiling_time(
+                                "load_safe_tensor_cpu_wait", time.time() - t
+                            )
+                        if self.profiling_mode:
+                            t = time.time()
+                        moved_layers = self.move_layer_to_device(state_dict)
+                        if self.profiling_mode:
+                            self.profiler.add_profiling_time(
+                                "create_layer_from_state_dict", time.time() - t
+                            )
+                        if (i + 1) < len(self.layer_names):
+                            if self.profiling_mode:
+                                t = time.time()
+                            future = executor.submit(
+                                _load_cpu_or_cache, self.layer_names[i + 1]
+                            )
+                            if self.profiling_mode:
+                                self.profiler.add_profiling_time(
+                                    "kick_off_load_cpu", time.time() - t
+                                )
+                    else:
+                        state_dict = self.load_layer_to_cpu(layer_name)
+                        if self.profiling_mode:
+                            t = time.time()
+                        moved_layers = self.move_layer_to_device(state_dict)
+                        if self.profiling_mode:
+                            self.profiler.add_profiling_time(
+                                "create_layer_from_safe_tensor", time.time() - t
+                            )
+
+                # Populate CPU cache for small layers when offloading (before move to meta).
+                if (
+                    getattr(self, "offload_small_layers", False)
+                    and getattr(self, "offload_small_layers_use_cpu_cache", False)
+                    and not _from_small_layer_cache
+                    and state_dict
+                    and (
+                        layer_name == self.layer_names_dict["embed"]
+                        or layer_name == self.layer_names_dict["norm"]
+                        or (
+                            layer_name == self.layer_names_dict["lm_head"]
+                            and not _tie_weights
                         )
+                    )
+                ):
+                    _cache_key = layer_name
+                    if _cache_key not in self._small_layers_cpu_cache:
+                        self._small_layers_cpu_cache[_cache_key] = {
+                            k: v.cpu().clone() for k, v in state_dict.items()
+                        }
 
                 if (
                     layer_name == self.layer_names_dict["lm_head"]
@@ -978,7 +1122,9 @@ class RabbitLLMBaseModel(GenerationMixin):
                     and getattr(self.config, "tie_word_embeddings", False)
                     and not getattr(self, "_small_layers_on_gpu", False)
                 ):
-                    embed_state_dict = self.load_layer_to_cpu(self.layer_names_dict["embed"])
+                    embed_state_dict = self.load_layer_to_cpu(
+                        self.layer_names_dict["embed"]
+                    )
                     embed_key = self.layer_names_dict["embed"] + ".weight"
                     lm_head_key = self.layer_names_dict["lm_head"] + ".weight"
                     if embed_key in embed_state_dict:
@@ -987,6 +1133,20 @@ class RabbitLLMBaseModel(GenerationMixin):
                             lm_head_key,
                             self.running_device,
                             value=embed_state_dict[embed_key],
+                            dtype=self.running_dtype,
+                        )
+                elif (
+                    layer_name == self.layer_names_dict["lm_head"]
+                    and getattr(self.config, "tie_word_embeddings", False)
+                ):
+                    embed_key = self.layer_names_dict["embed"] + ".weight"
+                    lm_head_key = self.layer_names_dict["lm_head"] + ".weight"
+                    if embed_key in state_dict:
+                        set_module_tensor_to_device(
+                            self.model,
+                            lm_head_key,
+                            self.running_device,
+                            value=state_dict[embed_key].to(self.running_device),
                             dtype=self.running_dtype,
                         )
 
@@ -1149,6 +1309,17 @@ class RabbitLLMBaseModel(GenerationMixin):
                             set_module_tensor_to_device(self.model, param_name, "meta")
                     else:
                         layer.to("meta")
+                # Release the current layer's state dict before flushing allocators.
+                # In the async_transfer path, state_dict and current_s are the SAME object
+                # (state_dict = current_s, line above). After layer.to("meta") frees the
+                # model parameters, both variables still hold a reference to the dict of
+                # GDS-loaded CuPy-backed tensors. While either reference is alive,
+                # cp.free_all_blocks() cannot return that VRAM to CUDA. Phase B overwrites
+                # current_s immediately after, so clearing it here is safe.
+                state_dict = None
+                moved_layers = None
+                if use_async_transfer:
+                    current_s = None
                 clean_memory()
                 if self.profiling_mode:
                     self.profiler.add_profiling_time(
@@ -1217,14 +1388,14 @@ class RabbitLLMBaseModel(GenerationMixin):
                             # Refill consumed slot with load(i+4); the other slot already has i+3
                             if _consumed_slot == 0:
                                 _next_cpu_future_0 = (
-                                    executor.submit(_load_cpu_fn, self.layer_names[i + 4])
+                                    executor.submit(_load_cpu_or_cache, self.layer_names[i + 4])
                                     if (i + 4) < n_layers
                                     else None
                                 )
                                 _next_cpu_idx_0 = (i + 4) if (i + 4) < n_layers else -1
                             elif _consumed_slot == 1:
                                 _next_cpu_future_1 = (
-                                    executor.submit(_load_cpu_fn, self.layer_names[i + 4])
+                                    executor.submit(_load_cpu_or_cache, self.layer_names[i + 4])
                                     if (i + 4) < n_layers
                                     else None
                                 )
@@ -1253,7 +1424,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                                     None,
                                 )
                             _next_cpu_future_0 = (
-                                executor.submit(_load_cpu_fn, self.layer_names[i + 3])
+                                executor.submit(_load_cpu_or_cache, self.layer_names[i + 3])
                                 if (i + 3) < n_layers
                                 else None
                             )
@@ -1261,7 +1432,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                     else:
                         _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
 
-        if use_cache:
+        if use_cache and not getattr(self, "offload_small_layers", False):
             self._small_layers_on_gpu = True
 
         return batch, kv_cache_list, all_hidden_states, all_self_attns

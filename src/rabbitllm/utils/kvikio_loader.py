@@ -122,27 +122,33 @@ def _load_safetensor_file_to_gpu(
 
         torch_dtype = dtype or _DTYPE_MAP[dtype_str]
 
-        # Load raw bytes to GPU (works for all dtypes including BF16)
-        dev_idx = 0
-        if device.startswith("cuda:") and len(device) > 5:
-            try:
-                dev_idx = int(device.split(":")[1])
-            except ValueError:
-                pass
-        with cp.cuda.Device(dev_idx):
-            buf = cp.empty((nbytes,), dtype=cp.uint8)
+        # Allocate via PyTorch and pass directly to kvikio — no CuPy involved.
+        #
+        # The original approach used cp.empty(nbytes, uint8) which puts the buffer
+        # inside CuPy's memory pool. That pool retains blocks even after the tensor is
+        # freed, so torch.cuda.empty_cache() cannot reclaim that VRAM.  Combined with
+        # torch.as_tensor(cupy_buf) producing a second PyTorch-side copy, each GDS
+        # load temporarily costs 2× the layer size. For 4 concurrent initial loads
+        # (embed 2.32 GiB + 3 decoder 0.46 GiB each) this totals ≈7.4 GiB — more
+        # than an 8 GB GPU's capacity before any cleanup code can run.
+        #
+        # kvikio's pread() accepts any object that exposes __cuda_array_interface__,
+        # which PyTorch CUDA tensors do. Allocating with torch.empty() means the
+        # buffer is fully managed by PyTorch's caching allocator: it is freed when the
+        # tensor is released and reclaimed by torch.cuda.empty_cache().
+        t_raw = torch.empty(nbytes, dtype=torch.uint8, device=device)
 
         with kvikio.CuFile(filepath, "r") as kvf:
-            future = kvf.pread(buf, file_offset=data_offset + off0)
+            future = kvf.pread(t_raw, file_offset=data_offset + off0)
             nread = future.get()
         if nread != nbytes:
             raise IOError(f"Short read: {nread} of {nbytes} bytes for {key}")
 
-        # CuPy uint8 buffer to PyTorch, view as target dtype
-        t = torch.as_tensor(buf, device=device).view(torch.uint8)
-        t = t.view(_DTYPE_MAP[dtype_str]).reshape(shape).contiguous()
-        if dtype is not None and t.dtype != dtype:
-            t = t.to(dtype)
+        t = t_raw.view(_DTYPE_MAP[dtype_str]).reshape(shape)
+        if not t.is_contiguous():
+            t = t.contiguous()
+        if dtype is not None and t.dtype != torch_dtype:
+            t = t.to(torch_dtype)
         result[key] = t
 
     return result

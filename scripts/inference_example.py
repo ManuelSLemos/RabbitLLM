@@ -29,6 +29,7 @@ parser.add_argument("--kv-cache-dir", default=None, metavar="DIR",
                          "Prevents VRAM accumulation on long contexts — use this to avoid OOM on "
                          "8 GB GPUs with full-precision 70B+ models. Each decode step loads only "
                          "the current layer's K/V from disk and frees it immediately after. "
+                         "When set, also enables offload of embed/norm/lm_head to avoid OOM. "
                          "Example: --kv-cache-dir /tmp/kv_cache")
 parser.add_argument("--use-gds", action="store_true",
                     help="Enable GPU Direct Storage (kvikio) for layer weight loading. "
@@ -37,6 +38,13 @@ parser.add_argument("--use-gds", action="store_true",
                          "For 72B bfloat16 this cuts weight-load time from ~200s to ~6s. "
                          "Pairs well with --kv-cache-dir: GDS speeds up weight loads, "
                          "kv-cache-dir prevents K/V VRAM accumulation.")
+parser.add_argument("--offload-small-layers", action="store_true",
+                    help="Offload embed/norm/lm_head to CPU each step (avoids OOM on 8 GB with 72B "
+                         "without quantization). Use with --kv-cache-dir. Keeps small layers in "
+                         "CPU cache by default for oLLM-like decode speed.")
+parser.add_argument("--no-offload-small-layers-cpu-cache", action="store_true",
+                    help="Disable CPU cache for offloaded small layers (use with --offload-small-"
+                         "layers). Slower decode but lower RAM.")
 parser.add_argument("--no-think", action="store_true",
                     help="Disable Qwen3 chain-of-thought thinking mode (adds /no_think system prompt).")
 parser.add_argument("--do-sample", action="store_true",
@@ -59,6 +67,8 @@ with warnings.catch_warnings():
 
 print(f"Using device: {device}  compression: {compression}  max_new_tokens: {args.max_new_tokens}")
 
+# Auto-enable small-layer offload when using kv_cache_dir to avoid OOM on 8 GB with 72B
+offload_small_layers = args.offload_small_layers or bool(args.kv_cache_dir)
 t0 = time.perf_counter()
 model = AutoModel.from_pretrained(
     args.model,
@@ -67,11 +77,15 @@ model = AutoModel.from_pretrained(
     cache_layers=args.cache_layers,
     kv_cache_dir=args.kv_cache_dir,
     use_gds=args.use_gds,
+    offload_small_layers=offload_small_layers,
+    offload_small_layers_use_cpu_cache=not args.no_offload_small_layers_cpu_cache,
 )
 load_s = time.perf_counter() - t0
 extras = []
 if args.kv_cache_dir:
     extras.append(f"kv_cache_dir={args.kv_cache_dir}")
+if offload_small_layers:
+    extras.append("offload_small_layers=True")
 if args.use_gds:
     extras.append("use_gds=True")
 extras_str = f"  [{', '.join(extras)}]" if extras else ""
