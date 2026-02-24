@@ -24,6 +24,19 @@ parser.add_argument("--cache-layers", type=int, default=None,
                          "Suggested: 30 for 4-bit 72B on 32 GB RAM.")
 parser.add_argument("--prompt", default="What is the capital of France?",
                     help="User message to send to the model.")
+parser.add_argument("--kv-cache-dir", default=None, metavar="DIR",
+                    help="Directory to offload the KV cache to disk. "
+                         "Prevents VRAM accumulation on long contexts — use this to avoid OOM on "
+                         "8 GB GPUs with full-precision 70B+ models. Each decode step loads only "
+                         "the current layer's K/V from disk and frees it immediately after. "
+                         "Example: --kv-cache-dir /tmp/kv_cache")
+parser.add_argument("--use-gds", action="store_true",
+                    help="Enable GPU Direct Storage (kvikio) for layer weight loading. "
+                         "Loads safetensors directly from disk to GPU, bypassing CPU RAM. "
+                         "Requires: pip install rabbitllm[gds] and compression=none. "
+                         "For 72B bfloat16 this cuts weight-load time from ~200s to ~6s. "
+                         "Pairs well with --kv-cache-dir: GDS speeds up weight loads, "
+                         "kv-cache-dir prevents K/V VRAM accumulation.")
 parser.add_argument("--no-think", action="store_true",
                     help="Disable Qwen3 chain-of-thought thinking mode (adds /no_think system prompt).")
 parser.add_argument("--do-sample", action="store_true",
@@ -52,9 +65,17 @@ model = AutoModel.from_pretrained(
     device=device,
     compression=compression,
     cache_layers=args.cache_layers,
+    kv_cache_dir=args.kv_cache_dir,
+    use_gds=args.use_gds,
 )
 load_s = time.perf_counter() - t0
-print(f"[time] model load: {load_s:.2f}s")
+extras = []
+if args.kv_cache_dir:
+    extras.append(f"kv_cache_dir={args.kv_cache_dir}")
+if args.use_gds:
+    extras.append("use_gds=True")
+extras_str = f"  [{', '.join(extras)}]" if extras else ""
+print(f"[time] model load: {load_s:.2f}s{extras_str}")
 
 system_content = "/no_think" if args.no_think else "You are a helpful assistant."
 messages = [

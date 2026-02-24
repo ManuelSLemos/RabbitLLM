@@ -9,8 +9,13 @@ Run:
 GDS (kvikio): GPU Direct Storage loads layers disk→GPU, bypassing CPU and
 pin_memory. For 72B bfloat16, pin_memory was ~200s; with GDS it drops to ~6s.
 
-DiskKVCache: Offloads KV cache to SSD for long contexts (50k+ tokens). Enables
-contexts that would OOM with the default in-GPU cache.
+DiskKVCache: Offloads the KV cache to SSD so that GPU holds at most ONE layer's
+K/V at a time.  On each forward pass a single DiskKVCache object is shared across
+all decoder layers; update() loads the previous K/V from disk, appends the new
+token, saves back, and returns the combined tensors — then releases GPU memory.
+The same cache object is returned as past_key_values so generate() passes it back
+on the next decode step.  This prevents VRAM accumulation across layers and tokens,
+enabling full-precision 70B+ inference on 8 GB GPUs without quantization.
 """
 
 import argparse
@@ -160,11 +165,17 @@ def run_long_context_benchmark(
     target_tokens: int = 2048,
     max_new_tokens: int = 32,
 ):
-    """Demonstrate DiskKVCache: long context with kv_cache_dir."""
-    print("\n=== Long Context (DiskKVCache) ===\n")
+    """Demonstrate DiskKVCache: long context without OOM, no quantization required.
+
+    With kv_cache_dir set, a single DiskKVCache is created per generation run.
+    Each layer's K/V is saved to disk and freed from GPU immediately after the
+    attention step, so VRAM holds at most one layer's K/V at any point.
+    """
+    print("\n=== Long Context (DiskKVCache — no quantization) ===\n")
     print(f"Model: {model_id}")
     print(f"Context length: ~{target_tokens} tokens")
-    print(f"KV cache: offloaded to temp directory")
+    print(f"Compression: none (full model quality)")
+    print(f"KV cache: offloaded to disk (one layer at a time in VRAM)")
     print()
 
     kv_dir = tempfile.mkdtemp(prefix="rabbitllm_kv_")
@@ -174,7 +185,7 @@ def run_long_context_benchmark(
         model = AutoModel.from_pretrained(
             model_id,
             device=device,
-            compression="4bit",
+            compression=None,  # full precision — no quantization required
             kv_cache_dir=kv_dir,
             max_seq_len=target_tokens + 128,
         )
@@ -220,8 +231,8 @@ def run_long_context_benchmark(
         print(f"  Wall time: {elapsed:.2f}s")
         print(f"  Reply: {reply.strip()[:120]}...")
         print()
-        print("  DiskKVCache enables 50k+ token contexts on limited VRAM.")
-        print("  Without kv_cache_dir, long contexts can OOM on 8GB GPUs.")
+        print("  DiskKVCache: GPU holds at most one layer's K/V at a time.")
+        print("  Full-precision 70B+ inference on 8 GB GPUs — no quantization needed.")
         print()
     finally:
         shutil.rmtree(kv_dir, ignore_errors=True)

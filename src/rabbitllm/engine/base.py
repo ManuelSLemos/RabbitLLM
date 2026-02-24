@@ -65,6 +65,8 @@ except ImportError:
     Cache = None
     DynamicCache = None
 
+from .kvcache import DiskKVCache
+
 
 class RabbitLLMBaseModel(GenerationMixin):
     """Layer-streaming causal LM: loads one layer at a time to GPU, runs forward, frees memory.
@@ -198,6 +200,10 @@ class RabbitLLMBaseModel(GenerationMixin):
         self.hf_quantizer = None
         self.attn_implementation = attn_implementation
         self._warned_no_kv_cache = False
+
+        # Single shared DiskKVCache for the current generation run (set in forward() when
+        # kv_cache_dir is active). None when kv_cache_dir is not set or use_cache is False.
+        self._active_disk_kv_cache = None
 
         # CPU layer cache: keeps up to cache_layers state_dicts in RAM between forward passes.
         # Reusing cached tensors skips disk I/O so pin_memory only pays a fast RAM→pinned
@@ -616,6 +622,26 @@ class RabbitLLMBaseModel(GenerationMixin):
             if original_idx is not None:
                 attn.layer_idx = original_idx
 
+    @contextlib.contextmanager
+    def _layer_idx_set(self, layer, idx: int):
+        """Temporarily set a decoder layer's attention layer_idx to ``idx``.
+
+        Used instead of :meth:`_layer_idx_as_zero` when a shared :class:`DiskKVCache`
+        is active: the cache uses the **real** decoder layer index as the key for its
+        disk files, so the attention module must report the correct index when it calls
+        ``cache.update()``.
+        """
+        attn = getattr(layer, "self_attn", None)
+        original_idx = None
+        if attn is not None and hasattr(attn, "layer_idx"):
+            original_idx = attn.layer_idx
+            attn.layer_idx = idx
+        try:
+            yield
+        finally:
+            if original_idx is not None:
+                attn.layer_idx = original_idx
+
     def _extract_kv_from_layer_output(self, layer_out, output_attentions=False):
         """Extract (hidden_states, k_cache, v_cache) from a decoder layer output."""
         return extract_kv_from_layer_output_fn(
@@ -626,18 +652,22 @@ class RabbitLLMBaseModel(GenerationMixin):
         )
 
     def _make_layer_past_kv_arg(self, k_cache=None, v_cache=None, decoder_layer_idx: int = 0):
-        """Build the past_key_value argument appropriate for the attention implementation."""
-        if self._uses_cache_objects:
-            if getattr(self, "kv_cache_dir", None):
-                from .kvcache import DiskKVCache
+        """Build the past_key_value argument appropriate for the attention implementation.
 
-                cache = DiskKVCache(
-                    self.kv_cache_dir,
-                    device=self.running_device,
-                    decoder_layer_idx=decoder_layer_idx,
-                )
-            else:
-                cache = DynamicCache()
+        When a shared :class:`DiskKVCache` is active (``self._active_disk_kv_cache`` is
+        set), that single object is passed directly to every decoder layer.  The cache's
+        ``update()`` method loads the previous K/V from disk, appends the new states, saves
+        back, and returns the combined tensors — no extra per-layer cache is created.
+
+        When no disk cache is active, a fresh ``DynamicCache`` is created per layer (the
+        existing behaviour for in-memory inference).
+        """
+        if self._uses_cache_objects:
+            disk_cache = self._active_disk_kv_cache
+            if disk_cache is not None:
+                # Pass the shared cache; layer_idx is set by _layer_idx_set(), not zeroed.
+                return {"past_key_value": disk_cache, "past_key_values": disk_cache}
+            cache = DynamicCache()
             if k_cache is not None and v_cache is not None:
                 cache.update(k_cache, v_cache, 0)
             # Qwen2 and other 4.47+ decoder layers expect past_key_values (plural)
@@ -1006,7 +1036,12 @@ class RabbitLLMBaseModel(GenerationMixin):
                                 **attention_mask_args,
                                 **position_ids_args,
                             }
-                            with self._layer_idx_as_zero(layer):
+                            _idx_ctx = (
+                                self._layer_idx_set(layer, i - 1)
+                                if self._active_disk_kv_cache is not None
+                                else self._layer_idx_as_zero(layer)
+                            )
+                            with _idx_ctx:
                                 layer_outputs = layer(seq, **kwargs)
                             new_seq, k_cache, v_cache = self._extract_kv_from_layer_output(
                                 layer_outputs,
@@ -1015,19 +1050,24 @@ class RabbitLLMBaseModel(GenerationMixin):
                             if output_attentions and not isinstance(layer_outputs, torch.Tensor):
                                 all_self_attns[i].append(layer_outputs[1])
                             if use_cache:
-                                if (
-                                    k_cache is None
-                                    and cache_utils_installed
-                                    and self._uses_cache_objects
-                                ):
-                                    pkv = kwargs.get("past_key_value") or kwargs.get(
-                                        "past_key_values"
-                                    )
-                                    if isinstance(pkv, Cache):
-                                        k_cache, v_cache = _get_kv_from_dynamic_cache_fn(pkv)
-                                if k_cache is not None:
-                                    kv_cache_list[i][0].append(k_cache)
-                                    kv_cache_list[i][1].append(v_cache)
+                                if self._active_disk_kv_cache is not None:
+                                    # DiskKVCache handles K/V storage; don't accumulate
+                                    # tensors in kv_cache_list to keep VRAM clean.
+                                    k_cache = v_cache = None
+                                else:
+                                    if (
+                                        k_cache is None
+                                        and cache_utils_installed
+                                        and self._uses_cache_objects
+                                    ):
+                                        pkv = kwargs.get("past_key_value") or kwargs.get(
+                                            "past_key_values"
+                                        )
+                                        if isinstance(pkv, Cache):
+                                            k_cache, v_cache = _get_kv_from_dynamic_cache_fn(pkv)
+                                    if k_cache is not None:
+                                        kv_cache_list[i][0].append(k_cache)
+                                        kv_cache_list[i][1].append(v_cache)
                         else:
                             len_seq = self.get_sequence_len(seq)
                             pos_embed_args = (
@@ -1060,24 +1100,34 @@ class RabbitLLMBaseModel(GenerationMixin):
                                     **attention_mask_args,
                                     **position_ids_args,
                                 }
-                                with self._layer_idx_as_zero(layer):
+                                _idx_ctx = (
+                                    self._layer_idx_set(layer, i - 1)
+                                    if self._active_disk_kv_cache is not None
+                                    else self._layer_idx_as_zero(layer)
+                                )
+                                with _idx_ctx:
                                     layer_out = layer(seq, **kwargs)
                                 new_seq, k_cache, v_cache = self._extract_kv_from_layer_output(
                                     layer_out
                                 )
-                                if (
-                                    k_cache is None
-                                    and cache_utils_installed
-                                    and self._uses_cache_objects
-                                ):
-                                    pkv = kwargs.get("past_key_value") or kwargs.get(
-                                        "past_key_values"
-                                    )
-                                    if isinstance(pkv, Cache):
-                                        k_cache, v_cache = _get_kv_from_dynamic_cache_fn(pkv)
-                                if k_cache is not None:
-                                    kv_cache_list[i][0].append(k_cache)
-                                    kv_cache_list[i][1].append(v_cache)
+                                if self._active_disk_kv_cache is not None:
+                                    # DiskKVCache handles K/V storage; don't accumulate
+                                    # tensors in kv_cache_list to keep VRAM clean.
+                                    k_cache = v_cache = None
+                                else:
+                                    if (
+                                        k_cache is None
+                                        and cache_utils_installed
+                                        and self._uses_cache_objects
+                                    ):
+                                        pkv = kwargs.get("past_key_value") or kwargs.get(
+                                            "past_key_values"
+                                        )
+                                        if isinstance(pkv, Cache):
+                                            k_cache, v_cache = _get_kv_from_dynamic_cache_fn(pkv)
+                                    if k_cache is not None:
+                                        kv_cache_list[i][0].append(k_cache)
+                                        kv_cache_list[i][1].append(v_cache)
 
                         batch[j] = new_seq
 
@@ -1247,30 +1297,45 @@ class RabbitLLMBaseModel(GenerationMixin):
         output_hidden_states,
         return_dict,
     ):
-        """Build logits tensor and CausalLMOutputWithPast (or tuple) from layer loop outputs."""
+        """Build logits tensor and CausalLMOutputWithPast (or tuple) from layer loop outputs.
+
+        When a :class:`DiskKVCache` was used during the layer loop (``_active_disk_kv_cache``
+        is set), the cache object itself is returned as ``past_key_values`` rather than the
+        legacy ``kv_cache_list`` tuple.  This ensures the caller (``generate()``) passes the
+        same object back on the next decode step, enabling incremental disk-backed decoding.
+        """
         logits = torch.cat(batch, 0)
-        if use_cache:
-            kv_cache_list = kv_cache_list[1:-2]
-            any_empty = False
-            for i in range(len(kv_cache_list)):
-                k_list, v_list = kv_cache_list[i][0], kv_cache_list[i][1]
-                if not k_list or not v_list:
-                    any_empty = True
-                    break
-            if any_empty:
-                if not self._warned_no_kv_cache:
-                    logger.warning(
-                        "KV cache was not filled by decoder layers;"
-                        " returning past_key_values=None. "
-                        "Generation will work but each step re-runs the full forward"
-                        " (no incremental decoding)."
-                    )
-                    self._warned_no_kv_cache = True
-                kv_cache_list = None
-            else:
+
+        disk_cache = self._active_disk_kv_cache
+        if disk_cache is not None and use_cache:
+            # The DiskKVCache already persisted all K/V to disk during the layer loop.
+            # Return the object directly so generate() can pass it back as past_key_values.
+            past_key_values_out = disk_cache
+        else:
+            past_key_values_out = None
+            if use_cache:
+                kv_cache_list = kv_cache_list[1:-2]
+                any_empty = False
                 for i in range(len(kv_cache_list)):
                     k_list, v_list = kv_cache_list[i][0], kv_cache_list[i][1]
-                    kv_cache_list[i] = (torch.cat(k_list, 0), torch.cat(v_list, 0))
+                    if not k_list or not v_list:
+                        any_empty = True
+                        break
+                if any_empty:
+                    if not self._warned_no_kv_cache:
+                        logger.warning(
+                            "KV cache was not filled by decoder layers;"
+                            " returning past_key_values=None. "
+                            "Generation will work but each step re-runs the full forward"
+                            " (no incremental decoding)."
+                        )
+                        self._warned_no_kv_cache = True
+                    kv_cache_list = None
+                else:
+                    for i in range(len(kv_cache_list)):
+                        k_list, v_list = kv_cache_list[i][0], kv_cache_list[i][1]
+                        kv_cache_list[i] = (torch.cat(k_list, 0), torch.cat(v_list, 0))
+                    past_key_values_out = kv_cache_list
 
         if output_attentions:
             all_self_attns = all_self_attns[0:-2]
@@ -1287,7 +1352,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                 v
                 for v in [
                     logits,
-                    tuple(kv_cache_list) if kv_cache_list is not None else None,
+                    tuple(past_key_values_out) if isinstance(past_key_values_out, list) else past_key_values_out,
                     tuple(all_hidden_states) if all_hidden_states is not None else None,
                     tuple(all_self_attns) if all_self_attns is not None else None,
                 ]
@@ -1296,7 +1361,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         return CausalLMOutputWithPast(
             loss=None,
             logits=logits,
-            past_key_values=tuple(kv_cache_list) if kv_cache_list is not None else None,
+            past_key_values=tuple(past_key_values_out) if isinstance(past_key_values_out, list) else past_key_values_out,
             hidden_states=tuple(all_hidden_states) if all_hidden_states is not None else None,
             attentions=tuple(all_self_attns) if all_self_attns is not None else None,
         )
@@ -1330,6 +1395,32 @@ class RabbitLLMBaseModel(GenerationMixin):
             self._reset_model()
         # When past_key_values is set (incremental decoding), reuse the same model so
         # embed/norm/lm_head stay on GPU and we skip loading them again.
+
+        # Initialise or reuse the shared DiskKVCache when kv_cache_dir is configured.
+        # A single cache object is created at the start of each generation run (prefill,
+        # past_key_values=None) and returned as past_key_values so generate() passes it
+        # back on every subsequent decode step.  This avoids accumulating K/V tensors in
+        # VRAM across all decoder layers and all tokens.
+        _effective_use_cache = use_cache if use_cache is not None else True
+        if (
+            self._uses_cache_objects
+            and getattr(self, "kv_cache_dir", None)
+            and _effective_use_cache
+        ):
+            if isinstance(past_key_values, DiskKVCache):
+                self._active_disk_kv_cache = past_key_values
+            elif past_key_values is None:
+                # Prefill: create a fresh cache, deleting any leftover files.
+                self._active_disk_kv_cache = DiskKVCache(
+                    self.kv_cache_dir,
+                    device=self.running_device,
+                    reset=True,
+                )
+            else:
+                # Caller supplied a legacy tuple cache; fall back to in-memory path.
+                self._active_disk_kv_cache = None
+        else:
+            self._active_disk_kv_cache = None
 
         batch = self._prepare_batch(input_ids)
         attention_mask, position_ids = self._create_masks()
