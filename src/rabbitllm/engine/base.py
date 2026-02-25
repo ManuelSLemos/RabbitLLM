@@ -3,7 +3,6 @@ import functools
 import logging
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
 
@@ -29,11 +28,11 @@ from ..utils import (
     clean_memory,
     find_or_create_local_splitted_path,
     is_flash_attention_available,
-    load_layer,
 )
 from ..utils.platform import is_cuda_available
 from . import layer_loading as layer_loading_impl
 from .attention import ATTN_FALLBACK_ORDER, create_model_from_config, resolve_attn_implementation
+from .pipeline import create_pipeline
 from .forward_utils import (
     _get_kv_from_dynamic_cache as _get_kv_from_dynamic_cache_fn,
 )
@@ -484,7 +483,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         self.layers.append(model_attr)
 
     def load_rotary_pos_emb_to_device(self):
-        state_dict = load_layer(
+        state_dict = layer_loading_impl.load_layer(
             self.checkpoint_path,
             self.layer_names_dict["rotary_pos_emb"],
             persister=self._persister,
@@ -771,62 +770,49 @@ class RabbitLLMBaseModel(GenerationMixin):
         torch.cuda.empty_cache()
         self._fix_attention_head_dim()
         self._position_embeddings_cache = None
-        kv_cache_list = [] if use_cache else None
-        if use_cache:
-            for _ in self.layers:
-                kv_cache_list.append(([], []))
+
+        kv_cache_list = [([], []) for _ in self.layers] if use_cache else None
         all_hidden_states = [[] for _ in range(len(self.layers))] if output_hidden_states else None
         all_self_attns = [[] for _ in range(len(self.layers))] if output_attentions else None
 
         n_layers = len(self.layer_names)
-        # Layers that stay on GPU between decode tokens (skip_meta=True) and are
-        # treated as "already loaded" during the decode loop (state_dict = {}).
-        #
-        # lm_head handling:
-        # • tie_word_embeddings=True  → lm_head shares storage with embed_tokens (same GPU
-        #   tensor, zero extra VRAM).  It MUST stay on GPU; moving it to meta breaks the
-        #   weight tie and causes garbage output.
-        # • tie_word_embeddings=False → lm_head is a separate ~2.32 GiB tensor on large
-        #   models (e.g. 72B).  Keeping it on GPU crowds out the 2-layer async copy pipeline
-        #   and causes OOM.  It is excluded and reloaded each token via the async pipeline
-        #   (Phase A of the last decoder layer), fully overlapping with compute.
+
+        # Layers that stay on GPU between decode tokens (skip_meta=True).
+        # lm_head with tie_word_embeddings must stay (it shares embed's tensor).
+        # lm_head without tie_word_embeddings is excluded: it's reloaded each token
+        # via the async pipeline to avoid OOM on large models.
         _tie_weights = getattr(self.config, "tie_word_embeddings", False)
         if getattr(self, "offload_small_layers", False):
-            small_layer_names = ()
+            small_layer_names: tuple = ()
         else:
             small_layer_names = (
                 self.layer_names_dict["embed"],
                 self.layer_names_dict["norm"],
             ) + ((self.layer_names_dict["lm_head"],) if _tie_weights else ())
-        # Async transfer: copy of layer i+1 starts BEFORE forward of layer i so they overlap.
-        # Set to False to fall back to sync prefetch (CPU background load only).
-        # See docs/TROUBLESHOOTING.md "Async CPU→GPU transfer".
-        _try_async_transfer = True
+
+        # Pipeline configuration.
+        # Async transfer: copy of layer i+1 overlaps with forward of layer i.
         use_async_transfer = (
-            _try_async_transfer
-            and self.prefetching
+            self.prefetching
             and getattr(self, "transfer_stream", None) is not None
             and n_layers >= 2
             and self.hf_quantizer is None
-            # NOTE: _small_layers_on_gpu (decode steps) is intentionally allowed; the
-            # initialization below skips embed (already on GPU) and starts the async
-            # pipeline from the first decoder layer so GPU↔CPU overlap is preserved.
         )
-
-        # When compression is active and async is enabled, background threads should load
-        # compressed tensors to CPU WITHOUT decompressing them.  Decompression is then done
-        # on the default CUDA stream in Phase B (after the async GPU copy), keeping background
-        # threads free of CUDA operations and avoiding interference with the forward stream.
+        # When compression + async: load compressed to CPU, decompress on GPU in Phase B.
         _async_decompress = use_async_transfer and self.compression is not None
         _load_cpu_fn = (
             functools.partial(self.load_layer_to_cpu, decompress=False)
             if _async_decompress
             else self.load_layer_to_cpu
         )
+        # Dual-prefetch: two concurrent CPU-load slots for very large models.
+        # Disabled when offload_small_layers (tight VRAM budget).
+        use_dual_prefetch = (
+            use_async_transfer and n_layers > 3 and not getattr(self, "offload_small_layers", False)
+        )
 
-        # Names of small layers that may be served from CPU cache to skip disk reads.
-        # lm_head is excluded when tie_word_embeddings because it shares embed's weight
-        # and is handled separately during inference (no standalone safetensor entry).
+        # Small-layer CPU cache (offload_small_layers): embed/norm/lm_head loaded once
+        # and kept in RAM, skipping disk I/O on subsequent decode steps.
         _cacheable_layer_names: frozenset = frozenset(
             filter(
                 None,
@@ -838,482 +824,104 @@ class RabbitLLMBaseModel(GenerationMixin):
             )
         )
 
-        def _load_cpu_or_cache(name: str):
-            """Return cached CPU state-dict for small layers (no disk I/O), else load normally."""
+        def _load_fn(name: str) -> dict:
+            """Load a layer, serving from the small-layer CPU cache when available.
+
+            Non-async paths clone the cached dict before calling move_to_device so that
+            the original CPU tensors remain intact for future decode steps.
+            Async paths skip the clone because async copy doesn't modify the source.
+            """
             if (
                 self.offload_small_layers
                 and self.offload_small_layers_use_cpu_cache
                 and name in _cacheable_layer_names
                 and name in self._small_layers_cpu_cache
             ):
-                return self._small_layers_cpu_cache[name]
+                cached = self._small_layers_cpu_cache[name]
+                if use_async_transfer:
+                    return cached
+                return {k: v.clone() for k, v in cached.items()}
             return _load_cpu_fn(name)
 
-        with torch.inference_mode(), ThreadPoolExecutor() as executor:
-            if use_async_transfer:
-                # Two-phase async: copy of layer i+1 starts BEFORE forward of layer i
-                # so they truly overlap.
-                # Phase A (per iter): copy runs on transfer_stream while forward runs on
-                # default stream.
-                # Phase B (per iter): after forward, sync transfer_stream and assign params.
-                # Dual-prefetch loads 4 layers concurrently (embed + 3 decoders) at startup.
-                # For Qwen-72B each decoder layer is ~1.76 GiB (gate/up/down_proj at 462 MiB
-                # each), so 4 layers fill 7.77 GiB — the entire 8 GB GPU — before the loop
-                # begins.  When offload_small_layers is active we already know VRAM is
-                # tight, so fall back to single-prefetch (max 3 layers in flight at once:
-                # current + pending-copy + one background load ≈ 5.8 GiB peak).
-                use_dual_prefetch = n_layers > 3 and not getattr(
-                    self, "offload_small_layers", False
-                )
-                # During decode steps, embed/norm/lm_head are already on GPU
-                # (_small_layers_on_gpu=True). Skip loading layer 0 (embed) and seed the
-                # pipeline from decoder layers directly.
-                _async_skip_layer0 = getattr(self, "_small_layers_on_gpu", False)
-                if self.profiling_mode:
-                    t = time.time()
-                if use_dual_prefetch:
-                    if _async_skip_layer0:
-                        # Embed already on GPU: load decoder_0, decoder_1, decoder_2 as the
-                        # first three in-flight items (s1 + two prefetch slots).
-                        fa = executor.submit(_load_cpu_or_cache, self.layer_names[1])
-                        fb = (
-                            executor.submit(_load_cpu_or_cache, self.layer_names[2])
-                            if n_layers > 2
-                            else None
-                        )
-                        fc = (
-                            executor.submit(_load_cpu_or_cache, self.layer_names[3])
-                            if n_layers > 3
-                            else None
-                        )
-                        s0 = {}  # embed placeholder — already on GPU
-                        s1 = fa.result()  # decoder_0
-                        _next_cpu_future_0 = fb  # decoder_1, absolute index 2
-                        _next_cpu_idx_0 = 2 if n_layers > 2 else -1
-                        _next_cpu_future_1 = fc  # decoder_2, absolute index 3
-                        _next_cpu_idx_1 = 3 if n_layers > 3 else -1
-                    else:
-                        # Normal prefill: submit four loads so two layers stay in flight.
-                        f0 = executor.submit(_load_cpu_or_cache, self.layer_names[0])
-                        f1 = executor.submit(_load_cpu_or_cache, self.layer_names[1])
-                        f2 = executor.submit(_load_cpu_or_cache, self.layer_names[2])
-                        f3 = executor.submit(_load_cpu_or_cache, self.layer_names[3])
-                        s0 = f0.result()
-                        s1 = f1.result()
-                        _next_cpu_future_0 = f2
-                        _next_cpu_idx_0 = 2
-                        _next_cpu_future_1 = f3
-                        _next_cpu_idx_1 = 3
-                else:
-                    if _async_skip_layer0:
-                        fa = executor.submit(_load_cpu_or_cache, self.layer_names[1])
-                        fb = (
-                            executor.submit(_load_cpu_or_cache, self.layer_names[2])
-                            if n_layers > 2
-                            else None
-                        )
-                        s0 = {}
-                        s1 = fa.result()
-                        _next_cpu_future_0 = fb
-                        _next_cpu_idx_0 = 2 if n_layers > 2 else -1
-                        _next_cpu_future_1 = None
-                        _next_cpu_idx_1 = -1
-                    else:
-                        f0 = executor.submit(_load_cpu_or_cache, self.layer_names[0])
-                        f1 = (
-                            executor.submit(_load_cpu_or_cache, self.layer_names[1])
-                            if n_layers > 1
-                            else None
-                        )
-                        s0 = f0.result()
-                        s1 = f1.result() if f1 is not None else None
-                        _next_cpu_future_0 = (
-                            executor.submit(_load_cpu_or_cache, self.layer_names[2])
-                            if n_layers > 2
-                            else None
-                        )
-                        _next_cpu_idx_0 = 2 if n_layers > 2 else -1
-                        _next_cpu_future_1 = None
-                        _next_cpu_idx_1 = -1
-                if self.profiling_mode:
-                    self.profiler.add_profiling_time("load_safe_tensor_cpu_wait", time.time() - t)
-                if self.profiling_mode:
-                    t = time.time()
-                if _async_skip_layer0:
-                    # Embed is already on GPU; no synchronous move needed for layer 0.
-                    current_moved_layers = []
-                    current_s = {}
-                else:
-                    # s0 was loaded via _load_cpu_fn which may have decompress=False
-                    # (async+compression path). Decompress it now before the synchronous
-                    # move so set_module_tensor_to_device does not see .4bit.* keys.
-                    if _async_decompress and s0:
-                        from ..utils.compression import uncompress_layer_state_dict
+        # Snapshot past sequence length before the loop (DiskKVCache updates it
+        # inside update(), so re-reading it per-layer gives wrong values for FA2).
+        _past_seq_len_snapshot = (
+            self.get_past_key_values_cache_seq_len(past_key_values)
+            if past_key_values is not None
+            else 0
+        )
 
-                        s0 = uncompress_layer_state_dict(s0)
-                    current_moved_layers = self.move_layer_to_device(s0)
-                    current_s = s0
-                if self.profiling_mode:
-                    self.profiler.add_profiling_time(
-                        "create_layer_from_state_dict", time.time() - t
-                    )
-                # Kick off async copy of first decoder layer NOW — overlaps with forward of
-                # embed (or layer 0).
-                if s1 is not None:
-                    _async_result = layer_loading_impl.move_layer_to_device_async(
-                        self.model,
-                        s1,
-                        self.running_device,
-                        self.running_dtype,
-                        stream=self.transfer_stream,
-                        hf_quantizer=self.hf_quantizer,
-                    )
-                    _pending_tensors, _pending_param_names = _async_result
-                    _pending_s_cpu = s1
-                else:
-                    _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
-                # Release local references to the initial state dicts so the GDS-loaded
-                # tensors are freed as soon as current_s / _pending_s_cpu are consumed.
-                # Without this, s0/s1 keep the embed (2.32 GiB) and first decoder layer
-                # alive for the entire inference pass, reducing available VRAM.
-                s0 = s1 = None
-            elif self.prefetching:
-                future = executor.submit(_load_cpu_or_cache, self.layer_names[0])
-
-            # Flush CuPy pool after the initial concurrent GDS loads.
-            # When use_gds=True, load_layer_to_cpu allocates a temporary CuPy buffer for
-            # each tensor (disk→GPU via kvikio) and then copies it to a contiguous PyTorch
-            # tensor. The CuPy buffers are freed back to CuPy's pool but NOT to CUDA until
-            # we call free_all_blocks(). For Qwen-72B the embed alone is 2.32 GiB, and the
-            # 4 concurrent initial loads (embed + 3 decoder layers) fill ~7.4 GiB before
-            # the main loop even starts — triggering OOM on 8 GB GPUs. Flushing here gives
-            # back those dead pool blocks so every subsequent layer load has room.
-            clean_memory()
-
-            # Snapshot the past sequence length ONCE before the layer loop.
-            # DiskKVCache._seq_len is updated inside update() on every decoder layer call,
-            # so querying it inside the loop would give len_p+1, len_p+2, ... for successive
-            # layers — causing Flash Attention's _upad_input to try indexing key_layer
-            # (size past+1) with attention_mask indices up to past+N, triggering the
-            # "device-side assert: index out of bounds" CUDA error on decode step 2+.
-            _past_seq_len_snapshot = (
-                self.get_past_key_values_cache_seq_len(past_key_values)
-                if past_key_values is not None
-                else 0
+        pipeline = create_pipeline(
+            layer_names=self.layer_names,
+            layers=self.layers,
+            load_fn=_load_fn,
+            model=self.model,
+            device=self.running_device,
+            dtype=self.running_dtype,
+            hf_quantizer=self.hf_quantizer,
+            transfer_stream=getattr(self, "transfer_stream", None),
+            prefetching=self.prefetching,
+            use_async_transfer=use_async_transfer,
+            use_dual_prefetch=use_dual_prefetch,
+            async_decompress=_async_decompress,
+            small_layer_names=small_layer_names,
+            small_layers_on_gpu=getattr(self, "_small_layers_on_gpu", False),
+            profiling_mode=self.profiling_mode,
+            profiler=self.profiler if self.profiling_mode else None,
+        )
+        if getattr(self, "show_layer_progress", True):
+            pipeline = tqdm(
+                pipeline,
+                desc=f"running layers({self.running_device})",
+                total=len(self.layers),
             )
 
-            layer_iter = enumerate(zip(self.layer_names, self.layers))
-            if getattr(self, "show_layer_progress", True):
-                layer_iter = tqdm(
-                    layer_iter,
-                    desc=f"running layers({self.running_device})",
-                    total=len(self.layers),
-                )
+        with torch.inference_mode():
+            for i, (layer_name, state_dict, moved_layers) in enumerate(pipeline):
+                layer = self.layers[i]
 
-            for i, (layer_name, layer) in layer_iter:
-                state_dict = None
-                moved_layers = None
-                _from_small_layer_cache = False
-                _is_tied_lm_head = (
-                    layer_name == self.layer_names_dict.get("lm_head")
-                    and _tie_weights
-                )
-                # On the async path the pipeline already serves small layers from
-                # _load_cpu_or_cache, so the in-loop cache check is redundant for
-                # embed/norm/lm_head (non-tied).  Exception: tied lm_head has no
-                # standalone safetensor — async loads an empty dict — so the cache
-                # must be consulted here to supply the embed weight as lm_head.
-                _check_cache = (
-                    not use_async_transfer or _is_tied_lm_head
-                ) and getattr(self, "offload_small_layers", False) and getattr(
-                    self, "offload_small_layers_use_cpu_cache", False
-                )
-                if _check_cache:
-                    _cache_key = (
-                        self.layer_names_dict["embed"]
-                        if _is_tied_lm_head
-                        else layer_name
-                    )
-                    if _cache_key in self._small_layers_cpu_cache:
-                        _from_small_layer_cache = True
-                        _cached = self._small_layers_cpu_cache[_cache_key]
-                        if _is_tied_lm_head:
-                            _embed_key = (
-                                self.layer_names_dict["embed"] + ".weight"
-                            )
-                            _lm_head_key = (
-                                self.layer_names_dict["lm_head"] + ".weight"
-                            )
-                            if _embed_key in _cached:
-                                set_module_tensor_to_device(
-                                    self.model,
-                                    _lm_head_key,
-                                    self.running_device,
-                                    value=_cached[_embed_key].to(
-                                        self.running_device
-                                    ),
-                                    dtype=self.running_dtype,
-                                )
-                            state_dict = _cached
-                            moved_layers = []
-                        else:
-                            state_dict = {
-                                k: v.clone() for k, v in _cached.items()
-                            }
-                            moved_layers = self.move_layer_to_device(
-                                state_dict
-                            )
-                if not _from_small_layer_cache:
-                    if layer_name in small_layer_names and getattr(
-                        self, "_small_layers_on_gpu", False
-                    ):
-                        state_dict = {}
-                        moved_layers = []
-                    elif use_async_transfer:
-                        state_dict = current_s
-                        moved_layers = current_moved_layers
-                    elif self.prefetching:
-                        if self.profiling_mode:
-                            t = time.time()
-                        state_dict = future.result()
-                        if self.profiling_mode:
-                            self.profiler.add_profiling_time(
-                                "load_safe_tensor_cpu_wait", time.time() - t
-                            )
-                        if self.profiling_mode:
-                            t = time.time()
-                        moved_layers = self.move_layer_to_device(state_dict)
-                        if self.profiling_mode:
-                            self.profiler.add_profiling_time(
-                                "create_layer_from_state_dict", time.time() - t
-                            )
-                        if (i + 1) < len(self.layer_names):
-                            if self.profiling_mode:
-                                t = time.time()
-                            future = executor.submit(
-                                _load_cpu_or_cache, self.layer_names[i + 1]
-                            )
-                            if self.profiling_mode:
-                                self.profiler.add_profiling_time(
-                                    "kick_off_load_cpu", time.time() - t
-                                )
-                    else:
-                        state_dict = self.load_layer_to_cpu(layer_name)
-                        if self.profiling_mode:
-                            t = time.time()
-                        moved_layers = self.move_layer_to_device(state_dict)
-                        if self.profiling_mode:
-                            self.profiler.add_profiling_time(
-                                "create_layer_from_safe_tensor", time.time() - t
-                            )
-
-                # Populate CPU cache for small layers when offloading (before move to meta).
+                # Populate small-layer CPU cache on first load (offload_small_layers).
                 if (
-                    getattr(self, "offload_small_layers", False)
-                    and getattr(self, "offload_small_layers_use_cpu_cache", False)
-                    and not _from_small_layer_cache
+                    self.offload_small_layers
+                    and self.offload_small_layers_use_cpu_cache
                     and state_dict
-                    and (
-                        layer_name == self.layer_names_dict["embed"]
-                        or layer_name == self.layer_names_dict["norm"]
-                        or (
-                            layer_name == self.layer_names_dict["lm_head"]
-                            and not _tie_weights
-                        )
-                    )
+                    and layer_name in _cacheable_layer_names
+                    and layer_name not in self._small_layers_cpu_cache
                 ):
-                    _cache_key = layer_name
-                    if _cache_key not in self._small_layers_cpu_cache:
-                        self._small_layers_cpu_cache[_cache_key] = {
-                            k: v.cpu().clone() for k, v in state_dict.items()
-                        }
+                    self._small_layers_cpu_cache[layer_name] = {
+                        k: v.cpu().clone() for k, v in state_dict.items()
+                    }
 
-                if (
-                    layer_name == self.layer_names_dict["lm_head"]
-                    and len(state_dict) == 0
-                    and getattr(self.config, "tie_word_embeddings", False)
-                    and not getattr(self, "_small_layers_on_gpu", False)
-                ):
-                    embed_state_dict = self.load_layer_to_cpu(
-                        self.layer_names_dict["embed"]
-                    )
-                    embed_key = self.layer_names_dict["embed"] + ".weight"
-                    lm_head_key = self.layer_names_dict["lm_head"] + ".weight"
-                    if embed_key in embed_state_dict:
-                        set_module_tensor_to_device(
-                            self.model,
-                            lm_head_key,
-                            self.running_device,
-                            value=embed_state_dict[embed_key],
-                            dtype=self.running_dtype,
-                        )
-                elif (
-                    layer_name == self.layer_names_dict["lm_head"]
-                    and getattr(self.config, "tie_word_embeddings", False)
-                ):
-                    embed_key = self.layer_names_dict["embed"] + ".weight"
-                    lm_head_key = self.layer_names_dict["lm_head"] + ".weight"
-                    if embed_key in state_dict:
-                        set_module_tensor_to_device(
-                            self.model,
-                            lm_head_key,
-                            self.running_device,
-                            value=state_dict[embed_key].to(self.running_device),
-                            dtype=self.running_dtype,
-                        )
+                # Handle tied lm_head: set lm_head.weight = embed.weight on device.
+                if layer_name == self.layer_names_dict.get("lm_head") and _tie_weights:
+                    self._load_tied_lm_head(state_dict)
 
                 if self.profiling_mode:
                     _forward_layer_start = time.time()
 
-                for j, seq in enumerate(batch):
-                    if layer_name == self.layer_names_dict["embed"]:
-                        batch[j] = layer(seq)
-                    elif layer_name == self.layer_names_dict["norm"]:
-                        batch[j] = self.run_norm(layer, seq)
-                        if output_hidden_states:
-                            all_hidden_states[i].append(batch[j])
-                    elif layer_name == self.layer_names_dict["lm_head"]:
-                        batch[j] = self.run_lm_head(layer, seq)
-                    else:
-                        if output_hidden_states:
-                            all_hidden_states[i].append(seq)
+                self._run_layer_forward(
+                    layer_name=layer_name,
+                    layer=layer,
+                    layer_idx=i,
+                    batch=batch,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    kv_cache_list=kv_cache_list,
+                    all_hidden_states=all_hidden_states,
+                    all_self_attns=all_self_attns,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    past_seq_len_snapshot=_past_seq_len_snapshot,
+                )
 
-                        self._fix_layer_attention_head_dim(layer)
-                        if past_key_values is not None:
-                            k_cache, v_cache = self._get_layer_past_kv(past_key_values, i - 1)
-                            len_p = _past_seq_len_snapshot
-                            len_s = self.get_sequence_len(seq)
-                            position_ids_args = self.get_position_ids_args(
-                                position_ids, len_p, len_s
-                            )
-                            attention_mask_args = self.get_attention_mask_args(
-                                attention_mask, len_p, len_s
-                            )
-                            past_key_value_args = self._make_layer_past_kv_arg(
-                                k_cache, v_cache, decoder_layer_idx=i - 1
-                            )
-                            # During decode the position is len_p (past tokens), not 0.
-                            # Never reuse _position_embeddings_cache here — it was computed for
-                            # the prefill sequence starting at position 0 and would produce wrong
-                            # RoPE values for all subsequent tokens (visible as multilingual garbage
-                            # in models with per-head q_norm/k_norm like Qwen3).
-                            pos_emb = self.get_pos_emb_args(len_p, len_s, layer=layer)
-                            # cache_position required by transformers 5.x for Flash/SDPA incremental
-                            cache_position = position_ids[:, len_p : len_p + len_s]
-                            kwargs = {
-                                "use_cache": True,
-                                "cache_position": cache_position,
-                                **past_key_value_args,
-                                **pos_emb,
-                                **attention_mask_args,
-                                **position_ids_args,
-                            }
-                            _idx_ctx = (
-                                self._layer_idx_set(layer, i - 1)
-                                if self._active_disk_kv_cache is not None
-                                else self._layer_idx_as_zero(layer)
-                            )
-                            with _idx_ctx:
-                                layer_outputs = layer(seq, **kwargs)
-                            new_seq, k_cache, v_cache = self._extract_kv_from_layer_output(
-                                layer_outputs,
-                                output_attentions=output_attentions,
-                            )
-                            if output_attentions and not isinstance(layer_outputs, torch.Tensor):
-                                all_self_attns[i].append(layer_outputs[1])
-                            if use_cache:
-                                if self._active_disk_kv_cache is not None:
-                                    # DiskKVCache handles K/V storage; don't accumulate
-                                    # tensors in kv_cache_list to keep VRAM clean.
-                                    k_cache = v_cache = None
-                                else:
-                                    if (
-                                        k_cache is None
-                                        and cache_utils_installed
-                                        and self._uses_cache_objects
-                                    ):
-                                        pkv = kwargs.get("past_key_value") or kwargs.get(
-                                            "past_key_values"
-                                        )
-                                        if isinstance(pkv, Cache):
-                                            k_cache, v_cache = _get_kv_from_dynamic_cache_fn(pkv)
-                                    if k_cache is not None:
-                                        kv_cache_list[i][0].append(k_cache)
-                                        kv_cache_list[i][1].append(v_cache)
-                        else:
-                            len_seq = self.get_sequence_len(seq)
-                            pos_embed_args = (
-                                {"position_embeddings": self._position_embeddings_cache}
-                                if self._position_embeddings_cache is not None
-                                else self.get_pos_emb_args(0, len_seq, layer=layer)
-                            )
-                            attention_mask_args = self.get_attention_mask_args(
-                                attention_mask, 0, len_seq
-                            )
-                            position_ids_args = self.get_position_ids_args(position_ids, 0, len_seq)
-                            if not use_cache:
-                                kwargs = {
-                                    "use_cache": False,
-                                    **pos_embed_args,
-                                    **attention_mask_args,
-                                    **position_ids_args,
-                                }
-                                new_seq = layer(seq, **kwargs)[0]
-                            else:
-                                past_kv_args = self._make_layer_past_kv_arg(
-                                    decoder_layer_idx=i - 1
-                                )
-                                pos_slice = position_ids[:, 0:len_seq]
-                                kwargs = {
-                                    "use_cache": True,
-                                    "cache_position": pos_slice,
-                                    **past_kv_args,
-                                    **pos_embed_args,
-                                    **attention_mask_args,
-                                    **position_ids_args,
-                                }
-                                _idx_ctx = (
-                                    self._layer_idx_set(layer, i - 1)
-                                    if self._active_disk_kv_cache is not None
-                                    else self._layer_idx_as_zero(layer)
-                                )
-                                with _idx_ctx:
-                                    layer_out = layer(seq, **kwargs)
-                                new_seq, k_cache, v_cache = self._extract_kv_from_layer_output(
-                                    layer_out
-                                )
-                                if self._active_disk_kv_cache is not None:
-                                    # DiskKVCache handles K/V storage; don't accumulate
-                                    # tensors in kv_cache_list to keep VRAM clean.
-                                    k_cache = v_cache = None
-                                else:
-                                    if (
-                                        k_cache is None
-                                        and cache_utils_installed
-                                        and self._uses_cache_objects
-                                    ):
-                                        pkv = kwargs.get("past_key_value") or kwargs.get(
-                                            "past_key_values"
-                                        )
-                                        if isinstance(pkv, Cache):
-                                            k_cache, v_cache = _get_kv_from_dynamic_cache_fn(pkv)
-                                    if k_cache is not None:
-                                        kv_cache_list[i][0].append(k_cache)
-                                        kv_cache_list[i][1].append(v_cache)
-
-                        batch[j] = new_seq
-
-                if (
-                    layer_name == self.layer_names_dict["embed"]
-                    and self._get_model_rotary_emb() is not None
-                ):
-                    self._position_embeddings_cache = self._compute_position_embeddings_from_model(
-                        batch, position_ids
+                if self.profiling_mode:
+                    self.profiler.add_profiling_time(
+                        "forward_per_layer", time.time() - _forward_layer_start
                     )
 
-                if output_hidden_states:
-                    all_hidden_states += (torch.cat(batch, 0),)
-
+                # Move layer back to meta to free GPU memory (unless it stays for decode).
                 skip_meta = use_cache and layer_name in small_layer_names
                 if not skip_meta:
                     if self.hf_quantizer is not None:
@@ -1321,133 +929,217 @@ class RabbitLLMBaseModel(GenerationMixin):
                             set_module_tensor_to_device(self.model, param_name, "meta")
                     else:
                         layer.to("meta")
-                # Release the current layer's state dict before flushing allocators.
-                # In the async_transfer path, state_dict and current_s are the SAME object
-                # (state_dict = current_s, line above). After layer.to("meta") frees the
-                # model parameters, both variables still hold a reference to the dict of
-                # GDS-loaded CuPy-backed tensors. While either reference is alive,
-                # cp.free_all_blocks() cannot return that VRAM to CUDA. Phase B overwrites
-                # current_s immediately after, so clearing it here is safe.
-                state_dict = None
-                moved_layers = None
-                if use_async_transfer:
-                    current_s = None
-                clean_memory()
-                if self.profiling_mode:
-                    self.profiler.add_profiling_time(
-                        "forward_per_layer",
-                        time.time() - _forward_layer_start,
-                    )
-
-                if use_async_transfer:
-                    # Phase B: finalize the copy that ran concurrently with this forward
-                    if _pending_tensors is not None:
-                        self.transfer_stream.synchronize()
-                        torch.cuda.current_stream().wait_stream(self.transfer_stream)
-                        # For compressed models: decompress packed tensors on GPU (default stream)
-                        # AFTER the async copy finishes.  This keeps the background threads free
-                        # of CUDA ops and ensures decompression does not race with the forward.
-                        if _async_decompress:
-                            _pending_tensors, _pending_param_names = (
-                                layer_loading_impl.decompress_layer_on_device(_pending_tensors)
-                            )
-                        # use_clone_fallback=False: after synchronize()+wait_stream() the tensors
-                        # are fully visible on the default stream — no clone needed, and cloning
-                        # would double peak VRAM (critical when embed+lm_head are already on GPU).
-                        layer_loading_impl.set_layer_params_from_tensors(
-                            self.model,
-                            _pending_tensors,
-                            self.running_device,
-                            self.running_dtype,
-                            use_clone_fallback=False,
-                            use_direct_set=True,
-                        )
-                        current_moved_layers = _pending_param_names
-                        current_s = _pending_s_cpu
-                        _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
-                    # Phase A (next iter): start async copy of layer i+2 to overlap with
-                    # forward of layer i+1
-                    if (i + 2) < n_layers:
-                        need_idx = i + 2
-                        if use_dual_prefetch:
-                            # Wait for the slot that has layer need_idx
-                            if _next_cpu_idx_0 == need_idx and _next_cpu_future_0 is not None:
-                                _next_cpu_s = _next_cpu_future_0.result()
-                                _consumed_slot = 0
-                            elif _next_cpu_idx_1 == need_idx and _next_cpu_future_1 is not None:
-                                _next_cpu_s = _next_cpu_future_1.result()
-                                _consumed_slot = 1
-                            else:
-                                _next_cpu_s = None
-                                _consumed_slot = -1
-                            if _next_cpu_s is not None:
-                                _async_result = layer_loading_impl.move_layer_to_device_async(
-                                    self.model,
-                                    _next_cpu_s,
-                                    self.running_device,
-                                    self.running_dtype,
-                                    stream=self.transfer_stream,
-                                    hf_quantizer=self.hf_quantizer,
-                                )
-                                _pending_tensors, _pending_param_names = _async_result
-                                _pending_s_cpu = _next_cpu_s
-                            else:
-                                _pending_tensors, _pending_param_names, _pending_s_cpu = (
-                                    None,
-                                    None,
-                                    None,
-                                )
-                            # Refill consumed slot with load(i+4); the other slot already has i+3
-                            if _consumed_slot == 0:
-                                _next_cpu_future_0 = (
-                                    executor.submit(_load_cpu_or_cache, self.layer_names[i + 4])
-                                    if (i + 4) < n_layers
-                                    else None
-                                )
-                                _next_cpu_idx_0 = (i + 4) if (i + 4) < n_layers else -1
-                            elif _consumed_slot == 1:
-                                _next_cpu_future_1 = (
-                                    executor.submit(_load_cpu_or_cache, self.layer_names[i + 4])
-                                    if (i + 4) < n_layers
-                                    else None
-                                )
-                                _next_cpu_idx_1 = (i + 4) if (i + 4) < n_layers else -1
-                        else:
-                            _next_cpu_s = (
-                                _next_cpu_future_0.result()
-                                if _next_cpu_future_0 is not None
-                                else None
-                            )
-                            if _next_cpu_s is not None:
-                                _async_result = layer_loading_impl.move_layer_to_device_async(
-                                    self.model,
-                                    _next_cpu_s,
-                                    self.running_device,
-                                    self.running_dtype,
-                                    stream=self.transfer_stream,
-                                    hf_quantizer=self.hf_quantizer,
-                                )
-                                _pending_tensors, _pending_param_names = _async_result
-                                _pending_s_cpu = _next_cpu_s
-                            else:
-                                _pending_tensors, _pending_param_names, _pending_s_cpu = (
-                                    None,
-                                    None,
-                                    None,
-                                )
-                            _next_cpu_future_0 = (
-                                executor.submit(_load_cpu_or_cache, self.layer_names[i + 3])
-                                if (i + 3) < n_layers
-                                else None
-                            )
-                            _next_cpu_idx_0 = (i + 3) if (i + 3) < n_layers else -1
-                    else:
-                        _pending_tensors, _pending_param_names, _pending_s_cpu = None, None, None
 
         if use_cache and not getattr(self, "offload_small_layers", False):
             self._small_layers_on_gpu = True
 
         return batch, kv_cache_list, all_hidden_states, all_self_attns
+
+    def _load_tied_lm_head(self, state_dict: dict) -> None:
+        """Set lm_head.weight = embed.weight on the running device.
+
+        Used when ``tie_word_embeddings=True``.  The lm_head has no standalone
+        safetensor file, so its weight must be sourced from the embed state_dict,
+        the small-layer CPU cache, or loaded fresh from disk.
+        """
+        embed_key = self.layer_names_dict["embed"] + ".weight"
+        lm_head_key = self.layer_names_dict["lm_head"] + ".weight"
+
+        # Synchronous path: state_dict may contain embed weights (non-async load).
+        if embed_key in state_dict:
+            set_module_tensor_to_device(
+                self.model,
+                lm_head_key,
+                self.running_device,
+                value=state_dict[embed_key].to(self.running_device),
+                dtype=self.running_dtype,
+            )
+            return
+
+        # offload_small_layers CPU cache path.
+        if (
+            self.offload_small_layers
+            and self.offload_small_layers_use_cpu_cache
+            and self.layer_names_dict["embed"] in self._small_layers_cpu_cache
+        ):
+            cached = self._small_layers_cpu_cache[self.layer_names_dict["embed"]]
+            if embed_key in cached:
+                set_module_tensor_to_device(
+                    self.model,
+                    lm_head_key,
+                    self.running_device,
+                    value=cached[embed_key].to(self.running_device),
+                    dtype=self.running_dtype,
+                )
+                return
+
+        # Fallback: state_dict is empty (async path, first prefill) — load embed from disk.
+        if not getattr(self, "_small_layers_on_gpu", False):
+            embed_state_dict = self.load_layer_to_cpu(self.layer_names_dict["embed"])
+            if embed_key in embed_state_dict:
+                set_module_tensor_to_device(
+                    self.model,
+                    lm_head_key,
+                    self.running_device,
+                    value=embed_state_dict[embed_key],
+                    dtype=self.running_dtype,
+                )
+
+    def _run_layer_forward(
+        self,
+        layer_name: str,
+        layer,
+        layer_idx: int,
+        batch: list,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        kv_cache_list,
+        all_hidden_states,
+        all_self_attns,
+        use_cache: bool,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        past_seq_len_snapshot: int,
+    ) -> None:
+        """Dispatch the forward pass for a single layer across all batch items."""
+        for j, seq in enumerate(batch):
+            if layer_name == self.layer_names_dict["embed"]:
+                batch[j] = layer(seq)
+            elif layer_name == self.layer_names_dict["norm"]:
+                batch[j] = self.run_norm(layer, seq)
+                if output_hidden_states:
+                    all_hidden_states[layer_idx].append(batch[j])
+            elif layer_name == self.layer_names_dict["lm_head"]:
+                batch[j] = self.run_lm_head(layer, seq)
+            else:
+                if output_hidden_states:
+                    all_hidden_states[layer_idx].append(seq)
+                self._fix_layer_attention_head_dim(layer)
+                batch[j] = self._run_decoder_layer(
+                    layer=layer,
+                    layer_idx=layer_idx,
+                    seq=seq,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    kv_cache_list=kv_cache_list,
+                    all_self_attns=all_self_attns,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    past_seq_len_snapshot=past_seq_len_snapshot,
+                )
+
+        # After embed: compute and cache RoPE position embeddings for decoder layers.
+        if (
+            layer_name == self.layer_names_dict["embed"]
+            and self._get_model_rotary_emb() is not None
+        ):
+            self._position_embeddings_cache = self._compute_position_embeddings_from_model(
+                batch, position_ids
+            )
+
+        if output_hidden_states:
+            all_hidden_states += (torch.cat(batch, 0),)
+
+    def _run_decoder_layer(
+        self,
+        layer,
+        layer_idx: int,
+        seq,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        kv_cache_list,
+        all_self_attns,
+        use_cache: bool,
+        output_attentions: bool,
+        past_seq_len_snapshot: int,
+    ):
+        """Run a single decoder layer forward, update KV cache, and return new hidden states."""
+        if past_key_values is not None:
+            # Decode step: has prior context.
+            k_cache, v_cache = self._get_layer_past_kv(past_key_values, layer_idx - 1)
+            len_p = past_seq_len_snapshot
+            len_s = self.get_sequence_len(seq)
+            # Never reuse _position_embeddings_cache here — it was computed for the prefill
+            # sequence starting at position 0 and would produce wrong RoPE values for decode
+            # steps (visible as garbage output on models with q_norm/k_norm like Qwen3).
+            pos_emb = self.get_pos_emb_args(len_p, len_s, layer=layer)
+            cache_position = position_ids[:, len_p : len_p + len_s]
+            kwargs = {
+                "use_cache": True,
+                "cache_position": cache_position,
+                **self._make_layer_past_kv_arg(k_cache, v_cache, decoder_layer_idx=layer_idx - 1),
+                **pos_emb,
+                **self.get_attention_mask_args(attention_mask, len_p, len_s),
+                **self.get_position_ids_args(position_ids, len_p, len_s),
+            }
+            _idx_ctx = (
+                self._layer_idx_set(layer, layer_idx - 1)
+                if self._active_disk_kv_cache is not None
+                else self._layer_idx_as_zero(layer)
+            )
+            with _idx_ctx:
+                layer_outputs = layer(seq, **kwargs)
+            new_seq, k_cache, v_cache = self._extract_kv_from_layer_output(
+                layer_outputs, output_attentions=output_attentions
+            )
+            if output_attentions and not isinstance(layer_outputs, torch.Tensor):
+                all_self_attns[layer_idx].append(layer_outputs[1])
+            if use_cache and self._active_disk_kv_cache is None:
+                if k_cache is None and cache_utils_installed and self._uses_cache_objects:
+                    pkv = kwargs.get("past_key_value") or kwargs.get("past_key_values")
+                    if isinstance(pkv, Cache):
+                        k_cache, v_cache = _get_kv_from_dynamic_cache_fn(pkv)
+                if k_cache is not None:
+                    kv_cache_list[layer_idx][0].append(k_cache)
+                    kv_cache_list[layer_idx][1].append(v_cache)
+        else:
+            # Prefill step: no prior context.
+            len_seq = self.get_sequence_len(seq)
+            pos_embed_args = (
+                {"position_embeddings": self._position_embeddings_cache}
+                if self._position_embeddings_cache is not None
+                else self.get_pos_emb_args(0, len_seq, layer=layer)
+            )
+            attention_mask_args = self.get_attention_mask_args(attention_mask, 0, len_seq)
+            position_ids_args = self.get_position_ids_args(position_ids, 0, len_seq)
+            if not use_cache:
+                kwargs = {
+                    "use_cache": False,
+                    **pos_embed_args,
+                    **attention_mask_args,
+                    **position_ids_args,
+                }
+                new_seq = layer(seq, **kwargs)[0]
+            else:
+                past_kv_args = self._make_layer_past_kv_arg(decoder_layer_idx=layer_idx - 1)
+                kwargs = {
+                    "use_cache": True,
+                    "cache_position": position_ids[:, 0:len_seq],
+                    **past_kv_args,
+                    **pos_embed_args,
+                    **attention_mask_args,
+                    **position_ids_args,
+                }
+                _idx_ctx = (
+                    self._layer_idx_set(layer, layer_idx - 1)
+                    if self._active_disk_kv_cache is not None
+                    else self._layer_idx_as_zero(layer)
+                )
+                with _idx_ctx:
+                    layer_out = layer(seq, **kwargs)
+                new_seq, k_cache, v_cache = self._extract_kv_from_layer_output(layer_out)
+                if self._active_disk_kv_cache is None:
+                    if k_cache is None and cache_utils_installed and self._uses_cache_objects:
+                        pkv = kwargs.get("past_key_value") or kwargs.get("past_key_values")
+                        if isinstance(pkv, Cache):
+                            k_cache, v_cache = _get_kv_from_dynamic_cache_fn(pkv)
+                    if k_cache is not None:
+                        kv_cache_list[layer_idx][0].append(k_cache)
+                        kv_cache_list[layer_idx][1].append(v_cache)
+        return new_seq
 
     def _reset_model(self):
         """Delete the model skeleton and reinitialize it (frees GPU memory before layer loop)."""

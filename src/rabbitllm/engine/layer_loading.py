@@ -7,11 +7,48 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from accelerate.utils.modeling import set_module_tensor_to_device
 
-from ..utils import load_layer
+from ..persist import ModelPersister
+from ..utils.compression import uncompress_layer_state_dict
 from ..utils.kvikio_loader import kvikio_available, load_safetensor_layer_to_gpu
 from ..utils.platform import is_cuda_available
 
 logger = logging.getLogger(__name__)
+
+
+def load_layer(
+    local_path: Union[str, "Path"],
+    layer_name: str,
+    profiling: bool = False,
+    persister: Optional[Any] = None,
+    decompress: bool = True,
+) -> Union[Dict[str, Any], Tuple[Dict[str, Any], float]]:
+    """Load a single layer state_dict from the split checkpoint, optionally with timing.
+
+    Args:
+        local_path: Path to the split checkpoint directory.
+        layer_name: Layer key (e.g. "model.layers.0").
+        profiling: If True, return (state_dict, elapsed_time) else state_dict.
+        persister: Optional ModelPersister; if None, uses get_model_persister().
+        decompress: If True (default), decompress 4-bit/8-bit layers on load.
+            Pass False when using the async transfer pipeline so that decompression
+            is deferred to the GPU after the async copy (see layer_loading.py).
+
+    Returns:
+        state_dict, or (state_dict, float) when profiling=True.
+    """
+    p = persister if persister is not None else ModelPersister.get_model_persister()
+    layer_state_dict = p.load_model(layer_name, local_path)
+
+    if profiling:
+        t = time.process_time()
+
+    to_return = uncompress_layer_state_dict(layer_state_dict) if decompress else layer_state_dict
+
+    if profiling:
+        elapsed_time = time.process_time() - t
+        return to_return, elapsed_time
+    else:
+        return to_return
 
 
 def load_layer_to_cpu(
