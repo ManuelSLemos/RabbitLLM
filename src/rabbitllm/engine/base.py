@@ -990,6 +990,18 @@ class RabbitLLMBaseModel(GenerationMixin):
             # back those dead pool blocks so every subsequent layer load has room.
             clean_memory()
 
+            # Snapshot the past sequence length ONCE before the layer loop.
+            # DiskKVCache._seq_len is updated inside update() on every decoder layer call,
+            # so querying it inside the loop would give len_p+1, len_p+2, ... for successive
+            # layers — causing Flash Attention's _upad_input to try indexing key_layer
+            # (size past+1) with attention_mask indices up to past+N, triggering the
+            # "device-side assert: index out of bounds" CUDA error on decode step 2+.
+            _past_seq_len_snapshot = (
+                self.get_past_key_values_cache_seq_len(past_key_values)
+                if past_key_values is not None
+                else 0
+            )
+
             layer_iter = enumerate(zip(self.layer_names, self.layers))
             if getattr(self, "show_layer_progress", True):
                 layer_iter = tqdm(
@@ -1169,7 +1181,7 @@ class RabbitLLMBaseModel(GenerationMixin):
                         self._fix_layer_attention_head_dim(layer)
                         if past_key_values is not None:
                             k_cache, v_cache = self._get_layer_past_kv(past_key_values, i - 1)
-                            len_p = self.get_past_key_values_cache_seq_len(past_key_values)
+                            len_p = _past_seq_len_snapshot
                             len_s = self.get_sequence_len(seq)
                             position_ids_args = self.get_position_ids_args(
                                 position_ids, len_p, len_s
