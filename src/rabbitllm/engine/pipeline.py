@@ -231,6 +231,11 @@ def _async_transfer_pipeline(
             t = time.time()
 
         # --- Startup: prime the CPU-load futures and kick off the first async GPU copy ---
+        #
+        # IMPORTANT: null startup Future variables (f0, f1, fa) immediately after extracting
+        # their results.  concurrent.futures.Future stores the result in _result and never
+        # clears it, so a named Future variable keeps the pinned-pool slot alive for the
+        # entire generator lifetime — permanently occupying slots and causing deadlock.
         if use_dual_prefetch:
             if _async_skip_layer0:
                 fa = executor.submit(load_fn, layer_names[1]) if n_layers > 1 else None
@@ -238,6 +243,7 @@ def _async_transfer_pipeline(
                 fc = executor.submit(load_fn, layer_names[3]) if n_layers > 3 else None
                 s0: Dict = {}
                 s1 = fa.result() if fa is not None else None
+                fa = None  # drop Future so its _result ref to the pinned slot is freed
                 _next_cpu_future_0 = fb
                 _next_cpu_idx_0 = 2 if n_layers > 2 else -1
                 _next_cpu_future_1 = fc
@@ -248,7 +254,9 @@ def _async_transfer_pipeline(
                 f2 = executor.submit(load_fn, layer_names[2]) if n_layers > 2 else None
                 f3 = executor.submit(load_fn, layer_names[3]) if n_layers > 3 else None
                 s0 = f0.result()
+                f0 = None  # drop Future _result ref
                 s1 = f1.result() if f1 is not None else None
+                f1 = None  # drop Future _result ref
                 _next_cpu_future_0 = f2
                 _next_cpu_idx_0 = 2 if n_layers > 2 else -1
                 _next_cpu_future_1 = f3
@@ -259,6 +267,7 @@ def _async_transfer_pipeline(
                 fb = executor.submit(load_fn, layer_names[2]) if n_layers > 2 else None
                 s0 = {}
                 s1 = fa.result() if fa is not None else None
+                fa = None  # drop Future _result ref
                 _next_cpu_future_0 = fb
                 _next_cpu_idx_0 = 2 if n_layers > 2 else -1
                 _next_cpu_future_1 = None
@@ -267,7 +276,9 @@ def _async_transfer_pipeline(
                 f0 = executor.submit(load_fn, layer_names[0])
                 f1 = executor.submit(load_fn, layer_names[1]) if n_layers > 1 else None
                 s0 = f0.result()
+                f0 = None  # drop Future _result ref
                 s1 = f1.result() if f1 is not None else None
+                f1 = None  # drop Future _result ref
                 _next_cpu_future_0 = (
                     executor.submit(load_fn, layer_names[2]) if n_layers > 2 else None
                 )

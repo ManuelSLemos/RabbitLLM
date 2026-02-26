@@ -65,6 +65,7 @@ def load_layer_to_cpu(
     use_gds: bool = True,
     device: str = "cuda:0",
     dtype: Optional[torch.dtype] = None,
+    pinned_pool: Optional[Any] = None,
 ) -> Dict[str, torch.Tensor]:
     """Load a layer's state_dict from checkpoint to CPU, optionally with pin_memory for prefetch.
 
@@ -96,6 +97,12 @@ def load_layer_to_cpu(
         Target device for GDS path (e.g. "cuda:0").
     dtype : torch.dtype, optional
         Target dtype for GDS path.
+    pinned_pool : PinnedMemoryPool, optional
+        Pre-allocated pinned memory pool.  When provided, tensors are copied into
+        a pre-pinned buffer (fast memcpy, no OS page-locking) instead of calling
+        ``tensor.pin_memory()`` per tensor.  The pool slot is released automatically
+        when the returned dict is garbage-collected.  Pass ``None`` to use the
+        legacy per-tensor ``pin_memory()`` path.
 
     Returns
     -------
@@ -155,10 +162,15 @@ def load_layer_to_cpu(
     if prefetching and use_pin_memory:
         t = time.time()
         if is_cuda_available():
-            for k in state_dict.keys():
-                # Only pin CPU tensors; skip tensors already on GPU (e.g. from eager decompress)
-                if state_dict[k].device.type == "cpu":
-                    state_dict[k] = state_dict[k].pin_memory()
+            if pinned_pool is not None:
+                # Fast path: memcpy into pre-pinned buffer (no OS page-locking).
+                state_dict = pinned_pool.pin(state_dict)
+            else:
+                # Legacy path: per-tensor OS page-locking (~1.7 s/layer at 70B scale).
+                for k in state_dict.keys():
+                    # Only pin CPU tensors; skip tensors already on GPU (e.g. from GDS)
+                    if state_dict[k].device.type == "cpu":
+                        state_dict[k] = state_dict[k].pin_memory()
         else:
             logger.debug("Prefetching is enabled, but no pin_memory operation is needed for CPU.")
         elapsed_time = time.time() - t
