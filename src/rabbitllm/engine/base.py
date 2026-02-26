@@ -204,6 +204,8 @@ class RabbitLLMBaseModel(GenerationMixin):
                 self.use_gds = False
         self.profiling_mode = profiling_mode
         self.profiler = LayeredProfiler()
+        self._profile_step: int = 0          # 0 = prefill, 1+ = decode steps
+        self._profile_aggregate = LayeredProfiler()  # accumulates all steps
 
         self.total_disk_loading_time = None
         self.total_gpu_loading_time = None
@@ -840,7 +842,12 @@ class RabbitLLMBaseModel(GenerationMixin):
                 cached = self._small_layers_cpu_cache[name]
                 if use_async_transfer:
                     return cached
-                return {k: v.clone() for k, v in cached.items()}
+                if self.profiling_mode:
+                    _t = time.time()
+                result = {k: v.clone() for k, v in cached.items()}
+                if self.profiling_mode:
+                    self.profiler.add_profiling_time("small_layer_cache_hit_clone", time.time() - _t)
+                return result
             return _load_cpu_fn(name)
 
         # Snapshot past sequence length before the loop (DiskKVCache updates it
@@ -888,13 +895,21 @@ class RabbitLLMBaseModel(GenerationMixin):
                     and layer_name in _cacheable_layer_names
                     and layer_name not in self._small_layers_cpu_cache
                 ):
+                    if self.profiling_mode:
+                        _t = time.time()
                     self._small_layers_cpu_cache[layer_name] = {
                         k: v.cpu().clone() for k, v in state_dict.items()
                     }
+                    if self.profiling_mode:
+                        self.profiler.add_profiling_time("small_layer_cache_populate", time.time() - _t)
 
                 # Handle tied lm_head: set lm_head.weight = embed.weight on device.
                 if layer_name == self.layer_names_dict.get("lm_head") and _tie_weights:
+                    if self.profiling_mode:
+                        _t = time.time()
                     self._load_tied_lm_head(state_dict)
+                    if self.profiling_mode:
+                        self.profiler.add_profiling_time("tied_lm_head_load", time.time() - _t)
 
                 if self.profiling_mode:
                     _forward_layer_start = time.time()
@@ -1035,9 +1050,13 @@ class RabbitLLMBaseModel(GenerationMixin):
             layer_name == self.layer_names_dict["embed"]
             and self._get_model_rotary_emb() is not None
         ):
+            if self.profiling_mode:
+                _t = time.time()
             self._position_embeddings_cache = self._compute_position_embeddings_from_model(
                 batch, position_ids
             )
+            if self.profiling_mode:
+                self.profiler.add_profiling_time("position_embeddings_compute", time.time() - _t)
 
         if output_hidden_states:
             all_hidden_states += (torch.cat(batch, 0),)
@@ -1264,6 +1283,8 @@ class RabbitLLMBaseModel(GenerationMixin):
             self.profiler.clear_profiling_time()
             forward_start = time.process_time()
             forward_start_wall = time.time()
+            if past_key_values is None:
+                self._profile_step = 0
 
         if past_key_values is None:
             self._small_layers_on_gpu = False
@@ -1324,7 +1345,9 @@ class RabbitLLMBaseModel(GenerationMixin):
         if self.profiling_mode:
             forward_elapsed_time = time.process_time() - forward_start
             forward_elapsed_time_wall = time.time() - forward_start_wall
-            self.profiler.print_profiling_time()
+            step_label = "prefill" if self._profile_step == 0 else f"decode t={self._profile_step}"
+            self.profiler.report(label=f"{step_label}  wall={forward_elapsed_time_wall:.3f}s")
+            self.profiler.accumulate_into(self._profile_aggregate)
             logger.info(
                 "total infer process time(including all above plus gpu compute): %.04f",
                 forward_elapsed_time,
@@ -1334,5 +1357,20 @@ class RabbitLLMBaseModel(GenerationMixin):
                 forward_elapsed_time_wall,
             )
             self.profiler.clear_profiling_time()
+            self._profile_step += 1
 
         return out
+
+    def print_profile_summary(self) -> None:
+        """Print an aggregate profiling report across all forward passes.
+
+        Call this once after generate() finishes to get a single table that
+        sums disk I/O, CPU->GPU transfer, GPU compute, etc. for the entire run.
+        Only meaningful when the model was created with profiling_mode=True.
+        """
+        if not self.profiling_mode:
+            logger.warning("print_profile_summary() called but profiling_mode=False — no data.")
+            return
+        n_decode = max(self._profile_step - 1, 0)
+        label = f"ALL {self._profile_step} forward passes  (1 prefill + {n_decode} decode)"
+        self._profile_aggregate.report(label=label)
