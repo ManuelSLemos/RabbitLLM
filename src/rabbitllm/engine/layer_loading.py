@@ -150,11 +150,43 @@ def load_layer_to_cpu(
         else:
             state_dict = load_layer_output
 
+        # When using the pinned pool and the layer fits in a pool slot, force eager
+        # materialization of mmap-backed tensors NOW (in the background prefetch thread),
+        # before populating the cache or calling pool.pin().
+        #
+        # safetensors uses mmap by default: load_layer() only creates the mapping,
+        # the actual disk pages are not faulted in until the bytes are first accessed.
+        # Without this clone, pool.pin()'s view.copy_() would trigger those page
+        # faults on the critical path (~400 ms/layer), defeating the prefetch overlap.
+        #
+        # By cloning here (in BG), disk I/O is overlapped with the previous layer's
+        # GPU forward pass.  Both the cache populate and pool.pin() below then work
+        # on already-in-RAM tensors → fast copies only (~11 ms each).
+        #
+        # For layers LARGER than the pool slot (e.g. embed_tokens in 72B bfloat16,
+        # ~2.48 GB), pool.pin() will fall back to pin_memory() anyway.  Eagerly
+        # cloning those layers would allocate 2× their size in RAM simultaneously
+        # (mmap + clone), causing severe memory pressure and swap.  Skip the eager
+        # clone for those layers and let the legacy pin_memory() path handle them.
+        if pinned_pool is not None:
+            _layer_cpu_bytes = sum(
+                v.numel() * v.element_size()
+                for v in state_dict.values()
+                if v.device.type == "cpu"
+            )
+            if _layer_cpu_bytes <= pinned_pool.slot_bytes:
+                state_dict = {
+                    k: v.clone() if v.device.type == "cpu" else v
+                    for k, v in state_dict.items()
+                }
+
         # Populate cache if enabled and there is room.
         if layer_cpu_cache is not None and (
             cache_layers_limit is None or len(layer_cpu_cache) < cache_layers_limit
         ):
-            # Store unpin'd CPU copies so they can be reused cheaply next token.
+            # Tensors are either: (a) already materialized by the clone above (pool
+            # path), or (b) still mmap-backed (no-pool path) — in which case this
+            # clone triggers the disk page faults, as before.
             layer_cpu_cache[layer_name] = {
                 k: v.clone() for k, v in state_dict.items() if v.device.type == "cpu"
             }
@@ -164,6 +196,9 @@ def load_layer_to_cpu(
         if is_cuda_available():
             if pinned_pool is not None:
                 # Fast path: memcpy into pre-pinned buffer (no OS page-locking).
+                # Tensors are already materialized (either from cache or from the
+                # eager-clone above), so pool.pin() is a pure RAM→pinned copy
+                # (~11 ms/layer, no disk access).
                 state_dict = pinned_pool.pin(state_dict)
             else:
                 # Legacy path: per-tensor OS page-locking (~1.7 s/layer at 70B scale).

@@ -237,14 +237,22 @@ def build_pool_for_checkpoint(
     layer_names: List[str],
     n_slots: int = 3,
     overhead_factor: float = 1.05,
+    max_pool_bytes: int = 3 * 1024 ** 3,
 ) -> Optional[PinnedMemoryPool]:
     """Build a :class:`PinnedMemoryPool` sized for the given checkpoint.
 
     Scans safetensors headers to find the largest layer, adds a small overhead
     margin (default 5 %), and allocates ``n_slots`` pinned buffers.
 
-    Returns ``None`` when CUDA is not available (pinning has no benefit on CPU)
-    or when the checkpoint directory contains no safetensors files.
+    Returns ``None`` when CUDA is not available (pinning has no benefit on CPU),
+    when the checkpoint directory contains no safetensors files, or when the
+    total pool size would exceed ``max_pool_bytes``.
+
+    The ``max_pool_bytes`` guard prevents allocating excessive pinned RAM for
+    large unquantized models (e.g. 72B bfloat16 layers are ~2.5 GB each →
+    3 slots = 7.5 GB locked, which starves the OS page cache and causes swap).
+    The default cap is 3 GiB, which comfortably covers 4-bit layers (~700 MiB ×
+    3 = 2.1 GiB) while gracefully skipping the pool for full-precision models.
 
     Args:
         checkpoint_path: Path to the split-layer checkpoint directory.
@@ -252,6 +260,10 @@ def build_pool_for_checkpoint(
         n_slots: Number of concurrent slots (3 recommended for dual-prefetch).
         overhead_factor: Multiplier applied to the largest shard size to give
             a small safety margin for alignment / rounding.
+        max_pool_bytes: Upper bound on total pinned pool size in bytes.  If
+            ``n_slots × slot_bytes`` would exceed this value the pool is not
+            created and ``None`` is returned.  Set to 0 to disable the pool
+            entirely; set to a very large value to remove the cap.
     """
     try:
         from ..utils.platform import is_cuda_available
@@ -267,6 +279,18 @@ def build_pool_for_checkpoint(
         return None
 
     slot_bytes = int(max_bytes * overhead_factor)
+    total_bytes = n_slots * slot_bytes
+    if max_pool_bytes > 0 and total_bytes > max_pool_bytes:
+        logger.info(
+            "PinnedMemoryPool: skipped — total size %.1f MiB exceeds cap %.1f MiB"
+            " (slot=%.1f MiB × %d slots). Using pin_memory() fallback.",
+            total_bytes / 1024**2,
+            max_pool_bytes / 1024**2,
+            slot_bytes / 1024**2,
+            n_slots,
+        )
+        return None
+
     try:
         return PinnedMemoryPool(n_slots=n_slots, slot_bytes=slot_bytes)
     except Exception as exc:
