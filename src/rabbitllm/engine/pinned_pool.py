@@ -257,7 +257,9 @@ def build_pool_for_checkpoint(
     Args:
         checkpoint_path: Path to the split-layer checkpoint directory.
         layer_names: All layer names (used to locate shard files).
-        n_slots: Number of concurrent slots (3 recommended for dual-prefetch).
+        n_slots: Number of concurrent slots.  3 is recommended for dual-prefetch;
+            4 is used when decode extra lookahead is active (two concurrent async GPU
+            copies in flight simultaneously during decode steps).
         overhead_factor: Multiplier applied to the largest shard size to give
             a small safety margin for alignment / rounding.
         max_pool_bytes: Upper bound on total pinned pool size in bytes.  If

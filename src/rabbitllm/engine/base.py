@@ -336,16 +336,30 @@ class RabbitLLMBaseModel(GenerationMixin):
         if prefetching and device.startswith("cuda"):
             self.stream = torch.cuda.Stream()
             self.transfer_stream = torch.cuda.Stream()
+            # Second transfer stream for decode extra lookahead.
+            # During decode, forward compute is much shorter than the PCIe transfer
+            # (~2ms vs ~30-120ms/layer). An extra copy in flight gives Phase B an
+            # additional forward pass worth of time to complete before syncing.
+            self.transfer_stream_b = torch.cuda.Stream()
         else:
             self.stream = None
             self.transfer_stream = None
+            self.transfer_stream_b = None
 
         # Pre-allocated pinned memory pool: eliminates per-layer OS page-locking cost.
         # Built after layer_names is known so the pool can be sized to the largest shard.
         # Only created when pin_memory is active and CUDA is available.
         if prefetch_pin_memory and prefetching and device.startswith("cuda"):
-            # Dual-prefetch uses 3 concurrent CPU slots; single-prefetch uses 2.
+            # Slot accounting:
+            #   single-prefetch:       2 slots (1 in-flight GPU copy + 1 being processed)
+            #   dual-prefetch:         3 slots (2 concurrent CPU loads + 1 in-flight GPU copy)
+            #   dual-prefetch + extra lookahead: 4 slots (same as dual + 1 more for the second
+            #     async GPU copy kicked off during decode Phase A)
             _n_pool_slots = 3 if len(self.layer_names) > 3 else 2
+            # Reserve an extra slot when the second transfer stream will be used during decode
+            # (decode_extra_lookahead path keeps 2 async GPU copies in-flight simultaneously).
+            if len(self.layer_names) > 3:
+                _n_pool_slots += 1  # 4 slots total: 3-slot dual-prefetch + 1 extra GPU copy
             self._pinned_pool: Optional[PinnedMemoryPool] = build_pool_for_checkpoint(
                 str(self.checkpoint_path),
                 self.layer_names,
@@ -831,6 +845,25 @@ class RabbitLLMBaseModel(GenerationMixin):
             use_async_transfer and n_layers > 3 and not getattr(self, "offload_small_layers", False)
         )
 
+        # Decode extra lookahead: during decode, each layer's forward pass is very short
+        # (~1-5ms) while the CPU→GPU transfer takes much longer (PCIe bottleneck).  With
+        # lookahead=1 (normal), Phase B stalls for nearly the full transfer time per layer.
+        # When a second transfer stream is available, we kick off an additional async copy
+        # (for layer i+3) alongside the normal one (layer i+2) in each Phase A.  The extra
+        # copy runs concurrently and gives Phase B of the FOLLOWING iteration an already-
+        # warm transfer that has had two forward passes worth of time to progress, reducing
+        # the stall by one forward-pass interval.  Most effective when transfer ≈ 2×forward
+        # (compressed / small layers on fast PCIe); provides architecture for deeper
+        # lookahead extensions.
+        _decode_mode = getattr(self, "_small_layers_on_gpu", False)
+        _transfer_stream_b = getattr(self, "transfer_stream_b", None)
+        use_decode_extra_lookahead = (
+            use_async_transfer
+            and _decode_mode
+            and _transfer_stream_b is not None
+            and n_layers > 4
+        )
+
         # Small-layer CPU cache (offload_small_layers): embed/norm/lm_head loaded once
         # and kept in RAM, skipping disk I/O on subsequent decode steps.
         _cacheable_layer_names: frozenset = frozenset(
@@ -885,9 +918,11 @@ class RabbitLLMBaseModel(GenerationMixin):
             dtype=self.running_dtype,
             hf_quantizer=self.hf_quantizer,
             transfer_stream=getattr(self, "transfer_stream", None),
+            transfer_stream_b=_transfer_stream_b if use_decode_extra_lookahead else None,
             prefetching=self.prefetching,
             use_async_transfer=use_async_transfer,
             use_dual_prefetch=use_dual_prefetch,
+            use_decode_extra_lookahead=use_decode_extra_lookahead,
             async_decompress=_async_decompress,
             small_layer_names=small_layer_names,
             small_layers_on_gpu=getattr(self, "_small_layers_on_gpu", False),

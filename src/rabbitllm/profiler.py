@@ -24,6 +24,8 @@ _CATEGORIES: Dict[str, str] = {
     "position_embeddings_compute": "RoPE position embeddings",
     # tied lm_head weight assignment
     "tied_lm_head_load": "Tied lm_head load",
+    # async transfer stream stall during Phase B (decode bottleneck)
+    "transfer_stream_sync_wait": "Transfer sync stall",
 }
 
 # Display order for the summary table.
@@ -39,6 +41,7 @@ _CATEGORY_ORDER: List[str] = [
     "Small layer cache hit (clone)",
     "RoPE position embeddings",
     "Tied lm_head load",
+    "Transfer sync stall",
     "Pipeline overhead",
     "Other",
 ]

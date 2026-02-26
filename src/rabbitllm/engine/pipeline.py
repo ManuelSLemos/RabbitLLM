@@ -44,9 +44,11 @@ def create_pipeline(
     dtype: torch.dtype,
     hf_quantizer: Optional[Any],
     transfer_stream: Optional[Any],
+    transfer_stream_b: Optional[Any] = None,
     prefetching: bool,
     use_async_transfer: bool,
     use_dual_prefetch: bool,
+    use_decode_extra_lookahead: bool = False,
     async_decompress: bool,
     small_layer_names: Tuple[str, ...],
     small_layers_on_gpu: bool,
@@ -71,7 +73,9 @@ def create_pipeline(
         return _async_transfer_pipeline(
             **common,
             transfer_stream=transfer_stream,
+            transfer_stream_b=transfer_stream_b,
             use_dual_prefetch=use_dual_prefetch,
+            use_decode_extra_lookahead=use_decode_extra_lookahead,
             async_decompress=async_decompress,
         )
     if prefetching:
@@ -204,7 +208,9 @@ def _async_transfer_pipeline(
     dtype: torch.dtype,
     hf_quantizer: Optional[Any],
     transfer_stream: Any,
+    transfer_stream_b: Optional[Any] = None,
     use_dual_prefetch: bool,
+    use_decode_extra_lookahead: bool = False,
     async_decompress: bool,
     small_layer_names: Tuple[str, ...],
     small_layers_on_gpu: bool,
@@ -219,7 +225,16 @@ def _async_transfer_pipeline(
 
     When ``use_dual_prefetch`` is True, two CPU-load slots run concurrently to
     keep both the background-load thread and the async GPU copy thread busy.
+
+    When ``use_decode_extra_lookahead`` is True (decode mode with a second transfer
+    stream available), Phase A also kicks off an additional async copy for layer i+3
+    on ``transfer_stream_b``.  This gives the i+3 copy two forward-pass intervals to
+    run on the PCIe bus before its Phase B synchronisation, reducing the stall when
+    the transfer time is close to 2× the forward time (e.g. compressed layers on fast
+    PCIe hardware).  For every other layer the benefit propagates forward through the
+    pipeline so that alternating layers can be served with lower stall.
     """
+    _extra = use_decode_extra_lookahead and transfer_stream_b is not None
     n_layers = len(layer_names)
     if n_layers == 0:
         return
@@ -229,6 +244,13 @@ def _async_transfer_pipeline(
     with ThreadPoolExecutor() as executor:
         if profiling_mode:
             t = time.time()
+        # Extra-lookahead state: a second async copy in-flight on transfer_stream_b.
+        # _pending_sync_stream tracks which stream the current _pending_tensors copy
+        # is on, since after promotion the near copy may be on transfer_stream_b.
+        _pending_far_tensors: Optional[Dict] = None
+        _pending_far_param_names: Optional[List[str]] = None
+        _pending_far_s_cpu: Optional[Dict] = None
+        _pending_sync_stream = transfer_stream  # updated when far is promoted to near
 
         # --- Startup: prime the CPU-load futures and kick off the first async GPU copy ---
         #
@@ -315,6 +337,32 @@ def _async_transfer_pipeline(
             _pending_tensors = _pending_param_names = _pending_s_cpu = None
 
         s0 = s1 = None  # release initial refs so GDS buffers can be reclaimed
+
+        # Extra-lookahead startup: consume the CPU future for layer 2 early and kick
+        # off its GPU copy on transfer_stream_b.  This gives the copy two forward-pass
+        # intervals before Phase B of iteration 1 needs it.
+        #
+        # At this point _next_cpu_future_0 holds the future for layer 2 and
+        # _next_cpu_idx_0 == 2 (the use_dual_prefetch + _async_skip_layer0 startup
+        # always sets it up this way, and _extra requires both flags).
+        if _extra and _next_cpu_future_0 is not None and _next_cpu_idx_0 == 2:
+            s2_extra = _next_cpu_future_0.result()
+            _next_cpu_future_0 = None
+            _far_startup = ll.move_layer_to_device_async(
+                model, s2_extra, device, dtype,
+                stream=transfer_stream_b, hf_quantizer=hf_quantizer,
+            )
+            _pending_far_tensors, _pending_far_param_names = _far_startup
+            _pending_far_s_cpu = s2_extra
+            # Shift futures: layer 3 (was in _next_cpu_idx_1) becomes the new _idx_0,
+            # and we submit a fresh future for layer 4 into _idx_1.
+            _next_cpu_future_0 = _next_cpu_future_1
+            _next_cpu_idx_0 = _next_cpu_idx_1
+            _next_cpu_future_1 = (
+                executor.submit(load_fn, layer_names[4]) if n_layers > 4 else None
+            )
+            _next_cpu_idx_1 = 4 if n_layers > 4 else -1
+
         clean_memory()
 
         # --- Main iteration loop ---
@@ -328,10 +376,16 @@ def _async_transfer_pipeline(
             current_s = None
             clean_memory()
 
-            # Phase B: finalize the async GPU copy that ran during this forward pass
+            # Phase B: finalize the async GPU copy that ran during this forward pass.
+            # _pending_sync_stream is transfer_stream normally, or transfer_stream_b when
+            # the current pending was promoted from the far slot in the previous Phase B.
             if _pending_tensors is not None:
-                transfer_stream.synchronize()
-                torch.cuda.current_stream().wait_stream(transfer_stream)
+                if profiling_mode:
+                    _t_sync = time.time()
+                _pending_sync_stream.synchronize()
+                if profiling_mode and profiler is not None:
+                    profiler.add_profiling_time("transfer_stream_sync_wait", time.time() - _t_sync)
+                torch.cuda.current_stream().wait_stream(_pending_sync_stream)
                 if async_decompress:
                     _pending_tensors, _pending_param_names = ll.decompress_layer_on_device(
                         _pending_tensors
@@ -347,6 +401,17 @@ def _async_transfer_pipeline(
                 current_moved_layers = _pending_param_names
                 current_s = _pending_s_cpu
                 _pending_tensors = _pending_param_names = _pending_s_cpu = None
+
+                # Extra-lookahead: promote the far copy (on transfer_stream_b) to the
+                # pending near slot so Phase B of the NEXT iteration syncs stream_b.
+                # The far copy has been running for the entire duration of this Phase B
+                # (including any stall time), giving it extra PCIe time to complete.
+                if _extra and _pending_far_tensors is not None:
+                    _pending_tensors = _pending_far_tensors
+                    _pending_param_names = _pending_far_param_names
+                    _pending_s_cpu = _pending_far_s_cpu
+                    _pending_sync_stream = transfer_stream_b
+                    _pending_far_tensors = _pending_far_param_names = _pending_far_s_cpu = None
 
             # Phase A: start async GPU copy for layer i+2 (overlaps with layer i+1 forward)
             if (i + 2) < n_layers:
@@ -373,6 +438,7 @@ def _async_transfer_pipeline(
                         )
                         _pending_tensors, _pending_param_names = _async_result
                         _pending_s_cpu = _next_cpu_s
+                        _pending_sync_stream = transfer_stream  # new near is on stream_a
 
                     if _consumed_slot == 0:
                         _next_cpu_future_0 = (
@@ -403,6 +469,7 @@ def _async_transfer_pipeline(
                         )
                         _pending_tensors, _pending_param_names = _async_result
                         _pending_s_cpu = _next_cpu_s
+                        _pending_sync_stream = transfer_stream  # new near is on stream_a
                     else:
                         _pending_tensors = _pending_param_names = _pending_s_cpu = None
                     _next_cpu_future_0 = (
@@ -413,3 +480,53 @@ def _async_transfer_pipeline(
                     _next_cpu_idx_0 = (i + 3) if (i + 3) < n_layers else -1
             else:
                 _pending_tensors = _pending_param_names = _pending_s_cpu = None
+
+            # Extra-lookahead Phase A: kick off an additional copy for layer i+3 on
+            # transfer_stream_b.  The normal Phase A above consumed the future for i+2;
+            # the remaining future (_next_cpu_idx_* == i+3) is consumed here and the
+            # slot is refilled with i+5 (normal Phase A refills its slot with i+4).
+            # This copy benefits from the Phase B stall of the CURRENT iteration (stream_b
+            # runs while stream_a's synchronize() blocks the host), so by Phase B of the
+            # NEXT iteration it has had stall_time + forward_time extra to complete.
+            if _extra and (i + 3) < n_layers:
+                _far_idx = i + 3
+                _far_cpu: Optional[Dict] = None
+                _far_consumed_slot = -1
+                if _next_cpu_idx_0 == _far_idx and _next_cpu_future_0 is not None:
+                    _far_cpu = _next_cpu_future_0.result()
+                    _far_consumed_slot = 0
+                    _next_cpu_future_0 = None
+                elif _next_cpu_idx_1 == _far_idx and _next_cpu_future_1 is not None:
+                    _far_cpu = _next_cpu_future_1.result()
+                    _far_consumed_slot = 1
+                    _next_cpu_future_1 = None
+                if _far_cpu is not None:
+                    _far_async = ll.move_layer_to_device_async(
+                        model, _far_cpu, device, dtype,
+                        stream=transfer_stream_b, hf_quantizer=hf_quantizer,
+                    )
+                    _pending_far_tensors, _pending_far_param_names = _far_async
+                    _pending_far_s_cpu = _far_cpu
+                    # Refill consumed slot with layer i+5
+                    if _far_consumed_slot == 0:
+                        _next_cpu_future_0 = (
+                            executor.submit(load_fn, layer_names[i + 5])
+                            if (i + 5) < n_layers else None
+                        )
+                        _next_cpu_idx_0 = (i + 5) if (i + 5) < n_layers else -1
+                    else:
+                        _next_cpu_future_1 = (
+                            executor.submit(load_fn, layer_names[i + 5])
+                            if (i + 5) < n_layers else None
+                        )
+                        _next_cpu_idx_1 = (i + 5) if (i + 5) < n_layers else -1
+                else:
+                    _pending_far_tensors = _pending_far_param_names = _pending_far_s_cpu = None
+
+            # After Phase A, the new near copy (if any) is always on transfer_stream.
+            # Reset the sync stream so Phase B of the next-but-one iteration syncs it,
+            # unless Phase B already promoted a far copy this iteration (in which case
+            # _pending_sync_stream is already set to transfer_stream_b).
+            if _extra and _pending_sync_stream is transfer_stream_b and _pending_tensors is None:
+                # No near copy was placed (i+2 out of range); no pending to sync next time.
+                _pending_sync_stream = transfer_stream
