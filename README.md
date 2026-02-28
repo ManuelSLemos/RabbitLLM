@@ -44,6 +44,21 @@ pip install rabbitllm[flash]
 If the prebuilt wheel is unavailable for your setup, install from
 [flashattn.dev](https://flashattn.dev). Without it, SDPA is used automatically.
 
+### Docker
+
+Build and run with GPU support (requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install.html) on the host):
+
+```bash
+docker build -t rabbitllm .
+docker run --gpus all -it rabbitllm python scripts/inference_example.py --model Qwen/Qwen2.5-0.5B-Instruct --max-new-tokens 20
+```
+
+Optional env vars: `HF_TOKEN` for gated models, `HF_HOME` for model cache directory. Example:
+
+```bash
+docker run --gpus all -e HF_TOKEN=hf_... -it rabbitllm python scripts/inference_example.py --model Qwen/Qwen2.5-7B-Instruct
+```
+
 ## Quickstart
 
 ```python
@@ -172,9 +187,17 @@ For 50k+ token contexts, pass `kv_cache_dir` to offload KV cache to SSD:
 model = AutoModel.from_pretrained("Qwen/Qwen2.5-72B-Instruct", kv_cache_dir="./kv_cache")
 ```
 
-### Benchmarking improvements
+### Benchmark
 
-To measure GDS and DiskKVCache improvements:
+Scripts to measure throughput and compare configurations:
+
+| Script | What it measures |
+|--------|------------------|
+| `scripts/benchmark_improvements.py` | GDS (GPU Direct Storage) and long-context DiskKVCache improvements |
+| `scripts/benchmark_cpu_vs_cuda.py` | CPU vs CUDA inference with layer-streaming (same model and prompt) |
+| `scripts/check_attention_and_benchmark.py --benchmark` | Throughput comparison: auto vs SDPA vs eager attention |
+
+**GDS and DiskKVCache:**
 
 ```bash
 # Local: make install pulls in kvikio (--extra gds)
@@ -186,6 +209,21 @@ uv run python scripts/benchmark_improvements.py --mode long_context
 pip install -e ".[gds]"
 python scripts/benchmark_improvements.py --mode gds
 ```
+
+**Quick CPU vs CUDA comparison:**
+
+```bash
+uv run python scripts/benchmark_cpu_vs_cuda.py
+uv run python scripts/benchmark_cpu_vs_cuda.py --model Qwen/Qwen2.5-1.5B-Instruct --runs 3
+```
+
+**Attention implementation (auto vs SDPA vs eager):**
+
+```bash
+uv run python scripts/check_attention_and_benchmark.py --benchmark
+```
+
+Detailed results and per-step breakdown for Qwen2.5-72B (e.g. pin_memory, async, 4-bit) are in [docs/BENCHMARK_HISTORY.md](docs/BENCHMARK_HISTORY.md).
 
 ### Gated models
 

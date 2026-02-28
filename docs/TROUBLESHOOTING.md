@@ -52,21 +52,21 @@ Common issues and how they were addressed in the codebase.
 
 **What to do**: Ensure `return_dict=True` when using `use_cache=True`. If the warning persists, the Cache API or layer kwargs may have changed. See [COMPATIBILITY.md](COMPATIBILITY.md) (Qwen2, KV cache).
 
-**Nota para versiones superiores (5.1+)**: Al subir transformers, **revalidar** el flujo de KV cache en layer-streaming: que el fallback siga leyendo correctamente del `DynamicCache` (atributos `.layers` vs `.key_cache`/`.value_cache`), que `cache_position` y `position_embeddings` se pasen con las formas esperadas en el primer e incremental forward, y que el mismo objeto cache que se pasa a la capa sea el que se inspecciona después. Solución pendiente si la API de Cache cambia en 5.1+.
+**Note for newer versions (5.1+)**: When upgrading transformers, **re-validate** the KV cache flow in layer-streaming: that the fallback still reads correctly from `DynamicCache` (attributes `.layers` vs `.key_cache`/`.value_cache`), that `cache_position` and `position_embeddings` are passed with the expected shapes on the first and incremental forward, and that the same cache object passed to the layer is the one inspected afterward. Fix pending if the Cache API changes in 5.1+.
 
-## Error 14 vs 64 en `apply_rotary_pos_emb` (transformers 5.1+)
+## Error 14 vs 64 in `apply_rotary_pos_emb` (transformers 5.1+)
 
-**Síntoma**: Al usar **versiones superiores de transformers** (5.1.x, 5.2.x o posteriores) con Qwen2/Qwen2.5 y **KV cache** (forward incremental), falla con:
+**Symptom**: When using **newer transformers versions** (5.1.x, 5.2.x or later) with Qwen2/Qwen2.5 and **KV cache** (incremental forward), it fails with:
 
 ```text
 RuntimeError: The size of tensor a (14) must match the size of tensor b (64) at non-singleton dimension 3
 ```
 
-(en `transformers/models/qwen2/modeling_qwen2.py`, en `apply_rotary_pos_emb`: `q_embed = (q * cos) + ...`).
+(in `transformers/models/qwen2/modeling_qwen2.py`, in `apply_rotary_pos_emb`: `q_embed = (q * cos) + ...`).
 
-**Causa**: En esas versiones, la atención puede crearse con un `head_dim` incorrecto (p. ej. 14 en lugar de `hidden_size // num_attention_heads` = 64). Los cos/sin de RoPE se calculan con 64 y el tensor `q` sale con última dimensión 14, de ahí el mismatch.
+**Cause**: In those versions, attention may be created with an incorrect `head_dim` (e.g. 14 instead of `hidden_size // num_attention_heads` = 64). RoPE cos/sin are computed with 64 and the `q` tensor has last dimension 14, hence the mismatch.
 
-**Qué hacer**: Quedarse en **transformers 5.0.x** para Qwen2/Qwen2.5 hasta tener una solución. Ver [COMPATIBILITY.md](COMPATIBILITY.md) (versiones superiores). **Solución pendiente** para 5.1+.
+**What to do**: Stay on **transformers 5.0.x** for Qwen2/Qwen2.5 until a fix is available. See [COMPATIBILITY.md](COMPATIBILITY.md) (newer versions). **Fix pending** for 5.1+.
 
 ## CUDA error: device-side assert (inf/nan in logits or sampling)
 
