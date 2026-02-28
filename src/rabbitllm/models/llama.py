@@ -1,6 +1,2 @@
-from ..engine.base import RabbitLLMBaseModel
-
-
-class RabbitLLMLlama2(RabbitLLMBaseModel):
-    def __init__(self, *args, **kwargs):
-        super(RabbitLLMLlama2, self).__init__(*args, **kwargs)
+# Backward-compatibility shim — implementation moved to base_models.py.
+from .base_models import RabbitLLMLlama2 as RabbitLLMLlama2  # noqa: F401

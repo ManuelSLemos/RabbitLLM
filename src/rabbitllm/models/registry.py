@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 if is_on_mac_os:
     from ..engine.mlx_engine import RabbitLLMLlamaMlx
+else:
+    from .base_models import RabbitLLMInternLM, RabbitLLMLlama2, RabbitLLMMistral  # noqa: F401
 
 
 class AutoModel:

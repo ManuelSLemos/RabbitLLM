@@ -3,12 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from glob import glob
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Union
 
-import huggingface_hub
 import torch
 from safetensors.torch import load_file
 from tqdm import tqdm
@@ -17,9 +15,11 @@ from ..persist import ModelPersister
 from .compression import (
     bitsandbytes_installed,
     compress_layer_state_dict,
-    uncompress_layer_state_dict,
 )
 from .memory import NotEnoughSpaceException, clean_memory
+
+# load_layer lives in engine/layer_loading; re-exported here for backward compatibility.
+from ..engine.layer_loading import load_layer as load_layer  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -77,42 +77,6 @@ def check_space(
             f" Existing space under {save_path} assuming can reuse:"
             f" {total_saved_split_files_size_bytes / 1024 / 1024 / 1024:.02f}GB."
         )
-
-
-def load_layer(
-    local_path: Union[Path, str],
-    layer_name: str,
-    profiling: bool = False,
-    persister: Optional[Any] = None,
-    decompress: bool = True,
-) -> Union[Dict[str, Any], Tuple[Dict[str, Any], float]]:
-    """Load a single layer state_dict from the split checkpoint, optionally with timing.
-
-    Args:
-        local_path: Path to the split checkpoint directory.
-        layer_name: Layer key (e.g. "model.layers.0").
-        profiling: If True, return (state_dict, elapsed_time) else state_dict.
-        persister: Optional ModelPersister; if None, uses get_model_persister().
-        decompress: If True (default), decompress 4-bit/8-bit layers on load.
-            Pass False when using the async transfer pipeline so that decompression
-            is deferred to the GPU after the async copy (see layer_loading.py).
-
-    Returns:
-        state_dict, or (state_dict, float) when profiling=True.
-    """
-    p = persister if persister is not None else ModelPersister.get_model_persister()
-    layer_state_dict = p.load_model(layer_name, local_path)
-
-    if profiling:
-        t = time.process_time()
-
-    to_return = uncompress_layer_state_dict(layer_state_dict) if decompress else layer_state_dict
-
-    if profiling:
-        elapsed_time = time.process_time() - t
-        return to_return, elapsed_time
-    else:
-        return to_return
 
 
 def split_and_save_layers(
@@ -333,73 +297,3 @@ def split_and_save_layers(
     return str(saving_path)
 
 
-def find_or_create_local_splitted_path(
-    model_local_path_or_repo_id: str,
-    layer_shards_saving_path: Optional[Union[Path, str]] = None,
-    compression: Optional[str] = None,
-    layer_names: Optional[Dict[str, str]] = None,
-    token: Optional[str] = None,
-    hf_token: Optional[str] = None,
-    delete_original: bool = False,
-) -> Tuple[Path, str]:
-    """Resolve local checkpoint path and ensure the model is split into per-layer files.
-
-    If the path is local and has an index, splits in place. Otherwise downloads from
-    HuggingFace (model_local_path_or_repo_id as repo ID) then splits.
-
-    Args:
-        model_local_path_or_repo_id: Local path or HuggingFace repo ID.
-        layer_shards_saving_path: Optional base path for split output.
-        compression: "4bit" or "8bit" for quantized layers.
-        layer_names: Dict for layer naming; inferred if None.
-        token: HuggingFace token for gated repos (preferred; v5 uses this).
-        hf_token: Deprecated alias for ``token``.
-        delete_original: If True, delete original shards after splitting.
-
-    Returns:
-        Tuple of (model_local_path, split_dir_path) where split_dir_path is the split output.
-    """
-    _token = token if token is not None else hf_token
-
-    if os.path.exists(model_local_path_or_repo_id):
-        has_index = os.path.exists(
-            Path(model_local_path_or_repo_id) / "pytorch_model.bin.index.json"
-        ) or os.path.exists(Path(model_local_path_or_repo_id) / "model.safetensors.index.json")
-        has_single_file = os.path.exists(Path(model_local_path_or_repo_id) / "model.safetensors")
-        if has_index or has_single_file:
-            logger.info("found model checkpoint...")
-            return Path(model_local_path_or_repo_id), split_and_save_layers(
-                model_local_path_or_repo_id,
-                layer_shards_saving_path,
-                compression=compression,
-                layer_names=layer_names,
-                delete_original=delete_original,
-            )
-        else:
-            logger.warning(
-                "Found local directory in %s, but didn't find downloaded model."
-                " Try using it as a HF repo...",
-                model_local_path_or_repo_id,
-            )
-
-    hf_cache_path = huggingface_hub.snapshot_download(
-        model_local_path_or_repo_id, token=_token, ignore_patterns=["*.safetensors", "*.bin"]
-    )
-
-    has_index = os.path.exists(
-        Path(hf_cache_path) / "pytorch_model.bin.index.json"
-    ) or os.path.exists(Path(hf_cache_path) / "model.safetensors.index.json")
-    if not has_index:
-        hf_cache_path = huggingface_hub.snapshot_download(
-            model_local_path_or_repo_id, token=_token, allow_patterns=["model.safetensors"]
-        )
-
-    return Path(hf_cache_path), split_and_save_layers(
-        hf_cache_path,
-        layer_shards_saving_path,
-        compression=compression,
-        layer_names=layer_names,
-        delete_original=delete_original,
-        repo_id=model_local_path_or_repo_id,
-        token=_token,
-    )

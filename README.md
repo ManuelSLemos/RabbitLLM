@@ -44,6 +44,21 @@ pip install rabbitllm[flash]
 If the prebuilt wheel is unavailable for your setup, install from
 [flashattn.dev](https://flashattn.dev). Without it, SDPA is used automatically.
 
+### Docker
+
+Build and run with GPU support (requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install.html) on the host):
+
+```bash
+docker build -t rabbitllm .
+docker run --gpus all -it rabbitllm python scripts/inference_example.py --model Qwen/Qwen2.5-0.5B-Instruct --max-new-tokens 20
+```
+
+Optional env vars: `HF_TOKEN` for gated models, `HF_HOME` for model cache directory. Example:
+
+```bash
+docker run --gpus all -e HF_TOKEN=hf_... -it rabbitllm python scripts/inference_example.py --model Qwen/Qwen2.5-7B-Instruct
+```
+
 ## Quickstart
 
 ```python
@@ -130,6 +145,8 @@ model = AutoModel.from_pretrained(
     max_seq_len=512,             # maximum sequence length
     prefetching=True,            # overlap layer loading with compute
     prefetch_pin_memory=True,    # faster CPU→GPU for small/medium models
+    use_gds=True,                # GPU Direct Storage (kvikio) when available
+    kv_cache_dir=None,           # path to offload KV cache for long context (50k+ tokens)
     token="hf_...",              # HuggingFace token for gated repos
     layer_shards_saving_path="/path/to/cache",  # custom split cache directory
     profiling_mode=False,        # print per-layer timing
@@ -149,6 +166,64 @@ model = AutoModel.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", compression="4bi
 ```
 
 Requires `bitsandbytes`: `pip install bitsandbytes`.
+
+### GPU Direct Storage (optional)
+
+For CUDA without compression, install `kvikio-cu12` to load layers directly from disk to GPU,
+bypassing CPU and pin_memory (can significantly speed up 70B+ models):
+
+```bash
+pip install rabbitllm[gds]
+# or: pip install kvikio-cu12
+```
+
+Set `use_gds=False` to disable.
+
+### Long context (KV cache on disk)
+
+For 50k+ token contexts, pass `kv_cache_dir` to offload KV cache to SSD:
+
+```python
+model = AutoModel.from_pretrained("Qwen/Qwen2.5-72B-Instruct", kv_cache_dir="./kv_cache")
+```
+
+### Benchmark
+
+Scripts to measure throughput and compare configurations:
+
+| Script | What it measures |
+|--------|------------------|
+| `scripts/benchmark_improvements.py` | GDS (GPU Direct Storage) and long-context DiskKVCache improvements |
+| `scripts/benchmark_cpu_vs_cuda.py` | CPU vs CUDA inference with layer-streaming (same model and prompt) |
+| `scripts/check_attention_and_benchmark.py --benchmark` | Throughput comparison: auto vs SDPA vs eager attention |
+
+**GDS and DiskKVCache:**
+
+```bash
+# Local: make install pulls in kvikio (--extra gds)
+make install
+uv run python scripts/benchmark_improvements.py --mode gds
+uv run python scripts/benchmark_improvements.py --mode long_context
+
+# Docker (make bash): install with GDS first
+pip install -e ".[gds]"
+python scripts/benchmark_improvements.py --mode gds
+```
+
+**Quick CPU vs CUDA comparison:**
+
+```bash
+uv run python scripts/benchmark_cpu_vs_cuda.py
+uv run python scripts/benchmark_cpu_vs_cuda.py --model Qwen/Qwen2.5-1.5B-Instruct --runs 3
+```
+
+**Attention implementation (auto vs SDPA vs eager):**
+
+```bash
+uv run python scripts/check_attention_and_benchmark.py --benchmark
+```
+
+Detailed results and per-step breakdown for Qwen2.5-72B (e.g. pin_memory, async, 4-bit) are in [docs/BENCHMARK_HISTORY.md](docs/BENCHMARK_HISTORY.md).
 
 ### Gated models
 
