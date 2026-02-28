@@ -39,6 +39,8 @@ All notable changes to RabbitLLM are documented here.
 - **`samples/`** directory with sample text for long-context testing.
 - **Test suite**: `tests/test_kvcache.py`, `tests/test_kvikio_loader.py`, `tests/test_profiler.py`,
   `tests/test_base_model.py`, and 6 additional test modules.
+- **Dockerfile** for easier deployment: build from repo with `docker build -t rabbitllm .`, run with `--gpus all` for GPU inference. Installs RabbitLLM with optional `[gds]` extra. README Docker subsection documents build, run, and env vars (`HF_TOKEN`, `HF_HOME`). Makefile targets `docker-build` and `docker-run`.
+- **Benchmark section** in README: table of benchmark scripts (GDS/long-context, CPU vs CUDA, attention comparison) and link to [docs/BENCHMARK_HISTORY.md](docs/BENCHMARK_HISTORY.md) for detailed 72B results.
 
 ### Changed
 - **Pipeline extracted to `engine/pipeline.py`**: three strategies — `_no_prefetch_pipeline`,
@@ -53,6 +55,7 @@ All notable changes to RabbitLLM are documented here.
   summary line (e.g. `[offload_small_layers=True, prefetch_pin_memory=False]`).
 - README documents `use_gds`, `kv_cache_dir`, `offload_small_layers`, `cache_layers`, and
   the optional `[gds]` extra.
+- **Documentation and in-repo text translated to English**: `docs/TRANSFORMERS_UPGRADE_PLAN.md`, `docs/BENCHMARK_HISTORY.md`, `docs/COMPATIBILITY.md`, `docs/TROUBLESHOOTING.md`, and `example.py` (docstring and comments).
 
 ### Fixed
 - **RoPE decode correctness**: prefill `position_embeddings_cache` is no longer reused in decode

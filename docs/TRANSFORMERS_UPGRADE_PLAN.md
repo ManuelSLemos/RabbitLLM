@@ -1,205 +1,205 @@
-# Plan de actualización de Transformers
+# Transformers upgrade plan
 
-Este documento describe un plan por fases para subir la versión de `transformers` desde el rango actual (`>=4.47,<4.57`) hasta la última estable que aporte valor al proyecto (v5.x), con los beneficios y riesgos de cada paso.
+This document describes a phased plan to upgrade the `transformers` version from the current range (`>=4.47,<4.57`) to the latest stable release that adds value to the project (v5.x), with the benefits and risks of each step.
 
-## Estado actual
+## Current status
 
-- **Restricción en `pyproject.toml`**: `transformers>=4.47,<4.57`
-- **Recomendación en COMPATIBILITY.md**: usar el último parche 4.56.x para máximo soporte de modelos (Qwen3, DeepSeek V3, Gemma2/3, Phi3, Llama 3.2, etc.)
-- **Última versión estable (febrero 2025)**: **v5.2.0** (rama 5.x con releases semanales)
-
----
-
-## Resumen ejecutivo
-
-| Fase | Versión objetivo | Esfuerzo | Beneficio principal |
-|------|------------------|----------|----------------------|
-| 1 | 4.56.x / 4.57.x | Bajo | Máximo soporte 4.x sin cambios de API |
-| 2 | Preparación v5 | Medio | Código listo para v5 (token, rope, cache) |
-| 3 | 5.0.x | Alto | Nueva API de pesos, tokenización unificada, mejor carga |
-| 4 | 5.1 / 5.2 | Bajo–Medio | Qwen3.5, GLM-5, Voxtral, correcciones y mejoras |
+- **Constraint in `pyproject.toml`**: `transformers>=4.47,<4.57`
+- **Recommendation in COMPATIBILITY.md**: use the latest 4.56.x patch for maximum model support (Qwen3, DeepSeek V3, Gemma2/3, Phi3, Llama 3.2, etc.)
+- **Latest stable version (February 2025)**: **v5.2.0** (5.x branch with weekly releases)
 
 ---
 
-## Fase 1: Maximizar 4.x (4.56 → 4.57 si está disponible)
+## Executive summary
 
-**Objetivo**: Usar el último parche de la rama 4.x dentro del rango ya soportado o ampliando ligeramente el techo.
-
-### Acciones
-
-1. **Comprobar disponibilidad de 4.57.x**  
-   En GitHub Releases hay tags como `v4.57.6`, `v4.57.5`, etc. Si el proyecto quiere quedarse en 4.x un tiempo más:
-   - Cambiar en `pyproject.toml`: `transformers>=4.47,<4.58` (o `<5.0` si se prefiere).
-   - Ejecutar `uv sync` y la suite de tests.
-
-2. **Fijar versión recomendada en documentación**  
-   En `docs/COMPATIBILITY.md`, indicar explícitamente “recomendado: 4.56.x o 4.57.x” según lo que se valide.
-
-### Beneficios
-
-- **Soporte de modelos**: Mejor cobertura de modelos recientes (Qwen3, DeepSeek V3, Gemma2/3, Phi3, Llama 3.2) que pueden depender de configuraciones o comportamientos de 4.56/4.57.
-- **Correcciones y seguridad**: Parches de bugs y posibles actualizaciones de dependencias transitivas.
-- **Sin cambios de API**: El código actual (GenerationMixin, `cache_utils`, configs) sigue siendo válido.
-
-### Riesgos
-
-- Muy bajos: el proyecto ya está dentro de `>=4.47,<4.57`; ampliar a 4.57.x es conservador.
+| Phase | Target version | Effort | Main benefit |
+|------|----------------|--------|---------------|
+| 1 | 4.56.x / 4.57.x | Low | Maximum 4.x support without API changes |
+| 2 | v5 preparation | Medium | Code ready for v5 (token, rope, cache) |
+| 3 | 5.0.x | High | New weights API, unified tokenization, better loading |
+| 4 | 5.1 / 5.2 | Low–Medium | Qwen3.5, GLM-5, Voxtral, fixes and improvements |
 
 ---
 
-## Fase 2: Preparación para v5 (compatible con 4.x y 5.x)
+## Phase 1: Maximize 4.x (4.56 → 4.57 if available)
 
-**Objetivo**: Introducir cambios que reduzcan el impacto del salto a v5, manteniendo compatibilidad con 4.x.
+**Goal**: Use the latest patch of the 4.x branch within the already supported range or by raising the ceiling slightly.
 
-### Acciones
+### Actions
 
-1. **Token de autenticación**  
-   - Buscar `use_auth_token` y `hf_token` en el código y ejemplos.
-   - Sustituir por `token` (v5 elimina `use_auth_token` en favor de `token`).  
-   - En v4, `token` ya es el parámetro recomendado; el cambio es compatible con ambas ramas.
+1. **Check availability of 4.57.x**  
+   GitHub Releases has tags such as `v4.57.6`, `v4.57.5`, etc. If the project wants to stay on 4.x a bit longer:
+   - In `pyproject.toml`, change to: `transformers>=4.47,<4.58` (or `<5.0` if preferred).
+   - Run `uv sync` and the test suite.
 
-2. **Acceso a RoPE en config**  
-   - En v5, `config.rope_theta` deja de existir; se usa `config.rope_parameters` (dict, p. ej. `rope_theta` dentro).
-   - En `src/rabbitllm/engine/mlx_engine.py` (y cualquier otro uso de `rope_theta`):
-     - Crear un helper que lea `getattr(config, 'rope_parameters', None)` y, si existe, tome `rope_theta` de ahí; si no, use `getattr(config, 'rope_theta', 10000)` para 4.x.
-   - Así el mismo código sirve en 4.x y 5.x.
+2. **Pin recommended version in documentation**  
+   In `docs/COMPATIBILITY.md`, state explicitly "recommended: 4.56.x or 4.57.x" depending on what is validated.
 
-3. **Cache por defecto en `generate`**  
-   - En v5, si no se pasa cache, el modelo elige su clase de cache por defecto (no siempre `DynamicCache`).  
-   - Revisar que los tests y flujos que asumen `DynamicCache` sigan pasando; si el proyecto pasa siempre `past_key_values` o un cache explícito, el impacto suele ser bajo.
+### Benefits
 
-4. **Tokenizador Baichuan**  
-   - `compat/tokenization_baichuan.py` usa `PreTrainedTokenizer` / `tokenization_utils`.  
-   - En v5, la base puede ser `PythonBackend` o similar; revisar la guía de migración v5 para tokenizers personalizados y, si hace falta, añadir un import condicional (v4 vs v5) para no romper 4.x.
+- **Model support**: Better coverage of recent models (Qwen3, DeepSeek V3, Gemma2/3, Phi3, Llama 3.2) that may depend on 4.56/4.57 configs or behavior.
+- **Bug fixes and security**: Patches and possible transitive dependency updates.
+- **No API changes**: Current code (GenerationMixin, `cache_utils`, configs) remains valid.
 
-5. **Documentar dependencias mínimas para v5**  
-   - v5 requiere, entre otros: Python 3.10+, PyTorch 2.4+ (según documentación reciente), `accelerate` 1.1.0+, `peft` 0.18.0+, `bitsandbytes` 0.46.1+.  
-   - Actualizar `pyproject.toml` y `docs/COMPATIBILITY.md` cuando se decida fijar la rama 5.x.
+### Risks
 
-### Beneficios
-
-- **Migración a v5 más corta**: Menos sorpresas el día del salto.
-- **Compatibilidad hacia atrás**: Se puede seguir en 4.56/4.57 hasta cerrar tests y despliegues.
-
-### Riesgos
-
-- Bajos si los helpers (p. ej. RoPE) se prueban en 4.x y luego en 5.x.
+- Very low: the project is already within `>=4.47,<4.57`; extending to 4.57.x is conservative.
 
 ---
 
-## Fase 3: Migración a Transformers 5.0.x
+## Phase 2: Preparation for v5 (compatible with 4.x and 5.x)
 
-**Objetivo**: Pasar a `transformers>=5.0,<5.1` (o `<6.0` si se quiere permitir 5.1/5.2 sin tocar deps).
+**Goal**: Introduce changes that reduce the impact of the jump to v5 while keeping compatibility with 4.x.
 
-### Cambios principales que afectan a RabbitLLM
+### Actions
+
+1. **Authentication token**  
+   - Search for `use_auth_token` and `hf_token` in code and examples.
+   - Replace with `token` (v5 removes `use_auth_token` in favor of `token`).  
+   - In v4, `token` is already the recommended parameter; the change is compatible with both branches.
+
+2. **RoPE access in config**  
+   - In v5, `config.rope_theta` is removed; use `config.rope_parameters` (dict, e.g. `rope_theta` inside).
+   - In `src/rabbitllm/engine/mlx_engine.py` (and any other use of `rope_theta`):
+     - Add a helper that reads `getattr(config, 'rope_parameters', None)` and, if present, takes `rope_theta` from there; otherwise use `getattr(config, 'rope_theta', 10000)` for 4.x.
+   - This keeps the same code working on 4.x and 5.x.
+
+3. **Default cache in `generate`**  
+   - In v5, if no cache is passed, the model chooses its default cache class (not always `DynamicCache`).  
+   - Ensure tests and flows that assume `DynamicCache` still pass; if the project always passes `past_key_values` or an explicit cache, impact is usually low.
+
+4. **Baichuan tokenizer**  
+   - `compat/tokenization_baichuan.py` uses `PreTrainedTokenizer` / `tokenization_utils`.  
+   - In v5 the base may be `PythonBackend` or similar; check the v5 migration guide for custom tokenizers and, if needed, add a conditional import (v4 vs v5) so 4.x is not broken.
+
+5. **Document minimum dependencies for v5**  
+   - v5 requires, among others: Python 3.10+, PyTorch 2.4+ (per recent docs), `accelerate` 1.1.0+, `peft` 0.18.0+, `bitsandbytes` 0.46.1+.  
+   - Update `pyproject.toml` and `docs/COMPATIBILITY.md` when the 5.x branch is decided.
+
+### Benefits
+
+- **Shorter migration to v5**: Fewer surprises on the day of the jump.
+- **Backward compatibility**: Can stay on 4.56/4.57 until tests and deployments are ready.
+
+### Risks
+
+- Low if helpers (e.g. RoPE) are tested on 4.x and then on 5.x.
+
+---
+
+## Phase 3: Migration to Transformers 5.0.x
+
+**Goal**: Move to `transformers>=5.0,<5.1` (or `<6.0` if 5.1/5.2 should be allowed without touching deps).
+
+### Main changes affecting RabbitLLM
 
 1. **GenerationMixin**  
-   - El proyecto ya usa fallback: `from transformers import GenerationMixin` o `from transformers.generation.utils import GenerationMixin`.  
-   - Comprobar en 5.0 que el import correcto sea el de `generation.utils` y que no se elimine el otro.
+   - The project already uses a fallback: `from transformers import GenerationMixin` or `from transformers.generation.utils import GenerationMixin`.  
+   - Verify in 5.0 that the correct import is from `generation.utils` and that the other is not removed.
 
 2. **Cache (`cache_utils`)**  
-   - Sigue existiendo; confirmar que `Cache` y `DynamicCache` no cambien de módulo o de firma en 5.0.  
-   - Si v5 documenta un “default cache class” por modelo, asegurarse de que el flujo de layer-streaming siga recibiendo el tipo de cache esperado.
+   - Still exists; confirm that `Cache` and `DynamicCache` do not change module or signature in 5.0.  
+   - If v5 documents a "default cache class" per model, ensure the layer-streaming flow still receives the expected cache type.
 
 3. **Config**  
-   - `rope_theta` → `config.rope_parameters` (ya preparado en Fase 2).  
-   - Configs anidados (p. ej. Qwen-VL): acceso vía subconfigs, no keys directas en el config raíz.  
-   - No cargar config desde URL; solo desde path local o repo en Hub (el proyecto ya usa paths/repo).
+   - `rope_theta` → `config.rope_parameters` (already prepared in Phase 2).  
+   - Nested configs (e.g. Qwen-VL): access via subconfigs, not direct keys on the root config.  
+   - Do not load config from URL; only from local path or Hub repo (the project already uses paths/repo).
 
-4. **Cuantización**  
-   - Eliminación de `load_in_4bit` / `load_in_8bit`; usar siempre `quantization_config=BitsAndBytesConfig(...)`.  
-   - Revisar scripts o docs que usen `load_in_4bit=True` y pasarlos a `BitsAndBytesConfig(load_in_4bit=True)`.
+4. **Quantization**  
+   - Removal of `load_in_4bit` / `load_in_8bit`; always use `quantization_config=BitsAndBytesConfig(...)`.  
+   - Update any scripts or docs that use `load_in_4bit=True` to `BitsAndBytesConfig(load_in_4bit=True)`.
 
-5. **Tokenización**  
-   - `apply_chat_template` devuelve `BatchEncoding` (dict con `input_ids`, `attention_mask`, etc.), no solo `input_ids`.  
-   - Cualquier código que espere solo `input_ids` debe usar `outputs["input_ids"]` (o equivalente).
+5. **Tokenization**  
+   - `apply_chat_template` returns `BatchEncoding` (dict with `input_ids`, `attention_mask`, etc.), not just `input_ids`.  
+   - Any code expecting only `input_ids` must use `outputs["input_ids"]` (or equivalent).
 
-6. **Atención**  
-   - Eliminación de head masking, relative position biases en Bert-like y head pruning; RabbitLLM no depende de ellos según la arquitectura actual.
+6. **Attention**  
+   - Removal of head masking, relative position biases in Bert-like, and head pruning; RabbitLLM does not depend on them for the current architecture.
 
-### Beneficios de 5.0
+### Benefits of 5.0
 
-- **Carga de pesos (WeightConverter)**: API para transformaciones de checkpoints (reshape, merge, split). Útil para futuras optimizaciones (cuantización, paralelismo) sin tocar tanto el código interno.
-- **Carga más rápida**: Mejoras de carga en dispositivo (hasta ~6x en escenarios de tensor parallel) y lógica de “meta device”.
-- **Tokenización unificada**: Un solo backend por modelo (TokenizersBackend / SentencePieceBackend), menos duplicación y menos bugs entre “slow” y “fast”.
-- **Tokenizers vacíos**: Posibilidad de instanciar tokenizers “en blanco” y entrenarlos; útil para experimentos o fine-tuning de tokenizer.
-- **MoE**: Mejoras de rendimiento en modelos MoE (Mixtral, etc.) con implementaciones agrupadas y `batched_mm`.
-- **Limpieza de deps**: Eliminación de TorchScript y torch.fx; enfoque en dynamo/export.
+- **Weight loading (WeightConverter)**: API for checkpoint transformations (reshape, merge, split). Useful for future optimizations (quantization, parallelism) without touching internal code as much.
+- **Faster loading**: Device loading improvements (up to ~6x in tensor parallel scenarios) and "meta device" logic.
+- **Unified tokenization**: Single backend per model (TokenizersBackend / SentencePieceBackend), less duplication and fewer bugs between "slow" and "fast".
+- **Empty tokenizers**: Ability to instantiate "blank" tokenizers and train them; useful for experiments or tokenizer fine-tuning.
+- **MoE**: Performance improvements for MoE models (Mixtral, etc.) with grouped implementations and `batched_mm`.
+- **Dependency cleanup**: Removal of TorchScript and torch.fx; focus on dynamo/export.
 
-### Riesgos
+### Risks
 
-- **Roto en 5.0**: Imports, config (rope, nested), tokenizer (Baichuan), cuantización y `apply_chat_template` pueden requerir ajustes concretos.
-- **Mitigación**: Fase 2 + branch dedicado + tests en CI con `transformers==5.0.x`.
+- **Breakage in 5.0**: Imports, config (rope, nested), tokenizer (Baichuan), quantization, and `apply_chat_template` may need concrete adjustments.
+- **Mitigation**: Phase 2 + dedicated branch + CI tests with `transformers==5.0.x`.
 
 ---
 
-## Fase 4: Actualización a 5.1.x y 5.2.x
+## Phase 4: Update to 5.1.x and 5.2.x
 
-**Objetivo**: Subir a las últimas 5.x para aprovechar nuevos modelos y correcciones.
+**Goal**: Move to the latest 5.x to benefit from new models and fixes.
 
-### Acciones
+### Actions
 
-1. **Actualizar restricción**  
-   - Por ejemplo: `transformers>=5.0,<5.3` o `>=5.2,<6.0`, según política de versionado del proyecto.
+1. **Update constraint**  
+   - For example: `transformers>=5.0,<5.3` or `>=5.2,<6.0`, depending on project versioning policy.
 
-2. **Revisar release notes**  
-   - **5.1**: EXAONE-MoE, PP-DocLayoutV3, Youtu-LLM, GLM-OCR; cambios en cache de generación (sliding window), T5Gemma2, DETR, etc.  
-   - **5.2**: VoxtralRealtime, GLM-5 (GlmMoeDsa), Qwen3.5 y Qwen3.5 MoE, VibeVoice; nueva interfaz de máscara de atención; cambios en ModernBERT.
+2. **Review release notes**  
+   - **5.1**: EXAONE-MoE, PP-DocLayoutV3, Youtu-LLM, GLM-OCR; generation cache changes (sliding window), T5Gemma2, DETR, etc.  
+   - **5.2**: VoxtralRealtime, GLM-5 (GlmMoeDsa), Qwen3.5 and Qwen3.5 MoE, VibeVoice; new attention mask interface; ModernBERT changes.
 
-3. **Atención a breaking changes**  
-   - 5.2: “New attn mask interface everywhere” y cambios en ModernBERT.  
-   - Si RabbitLLM usa máscaras de atención personalizadas o modelos tipo ModernBERT, hacer pruebas específicas.
+3. **Watch for breaking changes**  
+   - 5.2: "New attn mask interface everywhere" and ModernBERT changes.  
+   - If RabbitLLM uses custom attention masks or ModernBERT-like models, run specific tests.
 
-### Beneficios por versión
+### Benefits by version
 
 - **5.1**  
-  - Nuevos modelos (EXAONE-MoE, Youtu-LLM, GLM-OCR, etc.).  
-  - Cache de generación corregido para sliding window.  
-  - Mejoras en Trainer, vLLM compat, RoPE, FP8/DeepSpeed, etc.
+  - New models (EXAONE-MoE, Youtu-LLM, GLM-OCR, etc.).  
+  - Generation cache fixed for sliding window.  
+  - Trainer improvements, vLLM compat, RoPE, FP8/DeepSpeed, etc.
 
 - **5.2**  
-  - **Qwen3.5 y Qwen3.5 MoE**: modelos visión-lenguaje y MoE recientes.  
-  - **GLM-5 (GlmMoeDsa)**: soporte para modelos con DeepSeek Sparse Attention.  
-  - **VoxtralRealtime**: ASR en tiempo real (si el proyecto entra en audio).  
-  - Correcciones de bugs (MoE, cache, compilación, etc.).
+  - **Qwen3.5 and Qwen3.5 MoE**: recent vision-language and MoE models.  
+  - **GLM-5 (GlmMoeDsa)**: support for models with DeepSeek Sparse Attention.  
+  - **VoxtralRealtime**: real-time ASR (if the project adds audio).  
+  - Bug fixes (MoE, cache, compilation, etc.).
 
-### Riesgos
+### Risks
 
-- Cambios de interfaz de atención (5.2) pueden afectar a código que construye máscaras a mano; revisar `forward_utils` y `attention.py`.
+- Attention interface changes (5.2) may affect code that builds masks by hand; review `forward_utils` and `attention.py`.
 
-### Problemas conocidos al subir a 5.1+
+### Known issues when upgrading to 5.1+
 
-1. **Qwen2/Qwen2.5: 14 vs 64 en RoPE**  
-   Con layer-streaming y KV cache (segundo forward con `past_key_values`) aparece  
-   `RuntimeError: The size of tensor a (14) must match the size of tensor b (64) at non-singleton dimension 3` en `apply_rotary_pos_emb`.  
-   **Causa**: `head_dim` incorrecto en la atención. **Buscar solución** al planificar 5.1/5.2. Ver [COMPATIBILITY.md](COMPATIBILITY.md) y [TROUBLESHOOTING.md](TROUBLESHOOTING.md#error-14-vs-64-en-apply_rotary_pos_emb-transformers-51).
+1. **Qwen2/Qwen2.5: 14 vs 64 in RoPE**  
+   With layer-streaming and KV cache (second forward with `past_key_values`) you get  
+   `RuntimeError: The size of tensor a (14) must match the size of tensor b (64) at non-singleton dimension 3` in `apply_rotary_pos_emb`.  
+   **Cause**: Incorrect `head_dim` in attention. **Seek a fix** when planning 5.1/5.2. See [COMPATIBILITY.md](COMPATIBILITY.md) and [TROUBLESHOOTING.md](TROUBLESHOOTING.md#error-14-vs-64-in-apply_rotary_pos_emb-transformers-51).
 
-2. **KV cache en layer-streaming**  
-   En 4.47+ las capas decoder (Qwen2, etc.) no devuelven el cache en la tupla; actualizan el `DynamicCache` in-place. El motor usa un fallback leyendo del objeto cache (`.layers[0].keys`/`.values` o legacy `.key_cache`/`.value_cache`). Al subir a **5.1+**, comprobar que la API de Cache no haya cambiado y que el KV cache siga rellenándose; si reaparece el aviso *"KV cache was not filled"*, revalidar fallback, `cache_position`, `position_embeddings` y que se use el mismo objeto cache en paso e incremental. Ver [TROUBLESHOOTING.md](TROUBLESHOOTING.md#kv-cache-not-filled--no-incremental-decoding).
-
----
-
-## Flash Attention y detección automática
-
-- **Comportamiento "auto"**: Con `attn_implementation="auto"` (por defecto), el motor elige Flash Attention 2 cuando el sistema es compatible (flash-attn instalado, GPU Ampere+, dtype fp16/bf16) y una comprobación en runtime pasa; en caso contrario usa SDPA. No hace falta configurar nada a mano en máquinas compatibles.
-- **Detección**: `is_flash_attention_available()` en `utils/platform.py` comprueba: import de flash-attn, CUDA disponible, capacidad de cómputo ≥ 8.0, y un test mínimo con `flash_attn_func` para detectar incompatibilidades ABI/CUDA en runtime.
-- Documentación: `docs/COMPATIBILITY.md` (sección "Attention implementation (Flash Attention)").
+2. **KV cache in layer-streaming**  
+   In 4.47+ decoder layers (Qwen2, etc.) do not return the cache in the tuple; they update `DynamicCache` in-place. The engine uses a fallback that reads from the cache object (`.layers[0].keys`/`.values` or legacy `.key_cache`/`.value_cache`). When upgrading to **5.1+**, verify that the Cache API has not changed and that the KV cache is still filled; if the *"KV cache was not filled"* warning reappears, re-validate fallback, `cache_position`, `position_embeddings`, and that the same cache object is used in step and incremental. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#kv-cache-not-filled--no-incremental-decoding).
 
 ---
 
-## Orden recomendado de trabajo
+## Flash Attention and automatic detection
 
-1. **Fase 1** (rápida): Ampliar a 4.57.x en `pyproject.toml` y documentación; ejecutar tests.
-2. **Fase 2** (preparación): Implementar helper de RoPE, reemplazar `use_auth_token` por `token`, revisar Baichuan y `apply_chat_template`; tests en 4.x.
-3. **Fase 3** (migración v5): Branch con `transformers>=5.0,<5.1`; aplicar cambios de config, cuantización y tokenización; CI con 5.0.x.
-4. **Fase 4** (actualización continua): Subir a 5.1 y luego 5.2; leer release notes y ejecutar tests (y benchmarks si aplica) en cada paso.
+- **"auto" behavior**: With `attn_implementation="auto"` (default), the engine selects Flash Attention 2 when the system is compatible (flash-attn installed, Ampere+ GPU, fp16/bf16 dtype) and a runtime check passes; otherwise it uses SDPA. No manual configuration needed on compatible machines.
+- **Detection**: `is_flash_attention_available()` in `utils/platform.py` checks: flash-attn import, CUDA available, compute capability ≥ 8.0, and a minimal test with `flash_attn_func` to detect ABI/CUDA incompatibilities at runtime.
+- Documentation: `docs/COMPATIBILITY.md` (section "Attention implementation (Flash Attention)").
 
 ---
 
-## Referencias
+## Recommended order of work
 
-- [Releases de Transformers (GitHub)](https://github.com/huggingface/transformers/releases)
+1. **Phase 1** (quick): Extend to 4.57.x in `pyproject.toml` and docs; run tests.
+2. **Phase 2** (preparation): Implement RoPE helper, replace `use_auth_token` with `token`, review Baichuan and `apply_chat_template`; tests on 4.x.
+3. **Phase 3** (v5 migration): Branch with `transformers>=5.0,<5.1`; apply config, quantization, and tokenization changes; CI with 5.0.x.
+4. **Phase 4** (ongoing updates): Move to 5.1 then 5.2; read release notes and run tests (and benchmarks if applicable) at each step.
+
+---
+
+## References
+
+- [Transformers Releases (GitHub)](https://github.com/huggingface/transformers/releases)
 - [Transformers v5.0.0 release notes](https://github.com/huggingface/transformers/releases/tag/v5.0.0)
-- [Guía de migración v5 (main)](https://github.com/huggingface/transformers/blob/main/MIGRATION_GUIDE_V5.md)
-- [Blog Transformers v5](https://huggingface.co/blog/transformers-v5)
-- `docs/COMPATIBILITY.md` y `docs/ARCHITECTURE.md` en este repositorio
+- [v5 migration guide (main)](https://github.com/huggingface/transformers/blob/main/MIGRATION_GUIDE_V5.md)
+- [Transformers v5 blog](https://huggingface.co/blog/transformers-v5)
+- `docs/COMPATIBILITY.md` and `docs/ARCHITECTURE.md` in this repository

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Inferencia 70B+ sin cuantización, con KV cache en disco (evita OOM en 8 GB VRAM).
+70B+ inference without quantization, with KV cache on disk (avoids OOM on 8 GB VRAM).
 """
 
 import tempfile
@@ -13,16 +13,16 @@ with warnings.catch_warnings():
     warnings.filterwarnings("ignore", message=".*CUDA.*unknown error.*", category=UserWarning)
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-# Directorio para el KV cache (en disco, no en GPU)
+# Directory for KV cache (on disk, not on GPU)
 kv_cache_dir = tempfile.mkdtemp(prefix="rabbitllm_kv_")
-# Para uso persistente: kv_cache_dir = "./kv_cache"
+# For persistent use: kv_cache_dir = "./kv_cache"
 
 model = AutoModel.from_pretrained(
     "Qwen/Qwen2.5-72B-Instruct",
     device=device,
-    compression=None,           # sin cuantización, full precision
-    kv_cache_dir=kv_cache_dir, # KV cache a disco → evita OOM en 8 GB
-    max_seq_len=512,           # ajusta si necesitas contexto más largo
+    compression=None,           # no quantization, full precision
+    kv_cache_dir=kv_cache_dir, # KV cache to disk → avoids OOM on 8 GB
+    max_seq_len=512,            # increase if you need longer context
 )
 
 messages = [

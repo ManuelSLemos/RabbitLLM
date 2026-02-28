@@ -1,4 +1,4 @@
-.PHONY: install dev lint format test test-cov typecheck clean bash
+.PHONY: install dev lint format test test-cov typecheck clean bash docker-build docker-run
 
 install:
 	uv sync --extra gds
@@ -22,6 +22,12 @@ typecheck:
 
 clean:
 	rm -rf build/ dist/ *.egg-info .pytest_cache .ruff_cache .mypy_cache htmlcov/ .coverage .coverage.*
+
+docker-build:
+	docker build -t rabbitllm .
+
+docker-run:
+	docker run --gpus all --rm -it rabbitllm python scripts/inference_example.py --help
 
 bash:
 	docker run --gpus all --rm -it -v $(PWD):/app -w /app python:3.12 bash

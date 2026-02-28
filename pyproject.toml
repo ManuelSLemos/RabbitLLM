@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rabbitllm"
-version = "1.0.1"
+version = "1.1.0"
 description = "Run 70B+ LLMs on a single 4GB GPU — no quantization required. Layer-streaming inference for consumer hardware."
 readme = "README.md"
 license = "MIT"
